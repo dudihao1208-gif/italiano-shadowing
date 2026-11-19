@@ -423,7 +423,10 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 /* ---------------- worker ---------------- */
 function ensureWorker() {
   if (worker) return worker;
+  dbg("创建识别 worker…");
   worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  dbg("worker 对象已创建");
+  worker.addEventListener("message", (ev) => { if (ev.data && ev.data.type === "log") dbg("worker: " + ev.data.message); });
   return worker;
 }
 
@@ -433,7 +436,6 @@ function waitWorker(onProgress) {
     const handle = (ev) => {
       const msg = ev.data || {};
       if (msg.type === "progress" || msg.type === "log") {
-        if (msg.type === "log") dbg("worker: " + msg.message);
         if (onProgress) onProgress(msg);
         return;
       }
@@ -469,7 +471,6 @@ async function processFile(file) {
   cancelled = false;
   showView("work");
   $("workLog").textContent = "";
-  try { localStorage.setItem(DBG_KEY, "[]"); } catch (e) {}
   dbg("选择文件：" + (file.name || "") + " " + fmtBytes(file.size) + (IS_IOS ? " (iOS)" : ""));
   setWork("正在提取音频…", file.name || "", 5);
   let decoded;
@@ -570,6 +571,46 @@ async function runJob(job) {
   await openLesson(lesson.id, lesson);
 }
 
+
+/* ---------------- SRT mode (no ASR) ---------------- */
+function parseSrt(text) {
+  const out = [];
+  const re = /(\d{1,2}:)?(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->\s*(\d{1,2}:)?(\d{1,2}):(\d{2})[.,](\d{1,3})/;
+  const ts = (h, m, s, ms) => (h ? parseInt(h) * 3600 : 0) + parseInt(m) * 60 + parseInt(s) + parseInt(ms.padEnd(3, "0").slice(0, 3)) / 1000;
+  const lines = text.replace(/\r/g, "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(re);
+    if (!m) continue;
+    const body = [];
+    while (i + 1 < lines.length && lines[i + 1].trim() && !re.test(lines[i + 1])) body.push(lines[++i]);
+    const t = body.join(" ").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    if (t) out.push({ start: ts(m[1], m[2], m[3], m[4]), end: ts(m[5], m[6], m[7], m[8]), text: t });
+  }
+  return out;
+}
+async function processWithSrt(media, srtText) {
+  cancelled = false;
+  showView("work");
+  dbg("字幕模式：" + media.name + " + 字幕");
+  const segs = parseSrt(srtText);
+  if (!segs.length) { setWork("字幕文件里没有可用的时间轴", "请选择 .srt 或 .vtt 文件", 0); return; }
+  setWork("正在提取音频…", media.name, 10);
+  let pcm, duration;
+  try { const d = await decodeTo16kMono(media); pcm = d.pcm; duration = d.duration; }
+  catch (e) { setWork("无法提取音频", String(e.message || e), 0); return; }
+  const audio = encodeMp3(pcm) || encodeWav(pcm); pcm = null;
+  const sentences = toSentenceSegments(segs);
+  let tr = { zh: sentences.map(() => ""), method: "none", ok: 0 };
+  try { tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 30 + (i / n) * 65)); } catch (e) {}
+  const lesson = {
+    id: "L" + Date.now().toString(36), title: media.name.replace(/\.[^.]+$/, ""), createdAt: Date.now(), duration,
+    model: "srt", device: "-", dtype: "-", translationMethod: tr.method, audioMime: audio.type, audio,
+    sentences: sentences.map((s, i) => ({ i, start: s.start, end: s.end, it: s.text, zh: tr.zh[i] || "" })),
+  };
+  await putLesson(lesson);
+  dbg("字幕模式完成 " + sentences.length + " 句");
+  await openLesson(lesson.id, lesson);
+}
 
 /* ---------------- player ---------------- */
 function fmt(t) {
@@ -1100,6 +1141,11 @@ function boot() {
   modelSel.addEventListener("change", () => {
     try { localStorage.setItem("miraa-phone-model", modelSel.value); } catch (e) {}
   });
+  if (localStorage.getItem(LOADING_KEY) === TINY) $("tinyCrashNote").hidden = false;
+  let srtMediaFile = null;
+  $("btnSrt").addEventListener("click", () => { alert("第 1 步：选择音视频文件；第 2 步：选择对应的意大利语 .srt 字幕"); $("srtMedia").click(); });
+  $("srtMedia").addEventListener("change", () => { srtMediaFile = $("srtMedia").files[0]; $("srtMedia").value = ""; if (srtMediaFile) $("srtFile").click(); });
+  $("srtFile").addEventListener("change", async () => { const f = $("srtFile").files[0]; $("srtFile").value = ""; if (f && srtMediaFile) processWithSrt(srtMediaFile, await f.text()); });
   $("btnPick").addEventListener("click", () => filePick.click());
   filePick.addEventListener("change", () => {
     const f = filePick.files && filePick.files[0];
@@ -1135,6 +1181,7 @@ function boot() {
   // Expose a small hook for automated tests (localhost only).
   window.__miraa = {
     processFile,
+    processWithSrt,
     listLessons,
     getLesson,
     openLesson,

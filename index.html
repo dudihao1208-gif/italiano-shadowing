@@ -202,6 +202,10 @@
       </select>
       <p class="hint">识别在你的手机里完成，音视频不会上传到我们的服务器。翻译会请求免费的 MyMemory 接口；若失败，句子仍可跟读，只是没有中文。</p>
       <button type="button" class="primary" id="btnPick">从手机选择音视频</button>
+      <div id="tinyCrashNote" class="warn" hidden style="margin-top:12px">上次连 whisper-tiny 加载时页面也被关闭了：这台手机/这个 App 内浏览器内存不够跑本地识别。请先用 Safari 打开本网址再试；仍不行就用下面的「字幕模式」。</div>
+      <button type="button" id="btnSrt" style="width:100%;margin-top:10px">字幕模式：音视频 + .srt 字幕（不做识别，最省内存）</button>
+      <input id="srtMedia" class="hidden-file" type="file" accept="audio/*,video/*">
+      <input id="srtFile" class="hidden-file" type="file" accept=".srt,.vtt,text/plain">
       <input id="filePick" class="hidden-file" type="file" accept="audio/*,video/*,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac,.mp4,.mov,.webm,.mkv">
     </div>
     <div id="resumeBox" class="warn" hidden>

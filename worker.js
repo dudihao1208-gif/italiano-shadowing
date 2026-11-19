@@ -1,9 +1,21 @@
 /* Italian ASR worker — transformers.js Whisper, WebGPU then WASM. */
-import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
-
-env.allowLocalModels = false;
-env.useBrowserCache = true;
-try { env.backends.onnx.wasm.numThreads = 1; env.backends.onnx.wasm.proxy = false; } catch (e) {}
+self.postMessage({ type: "log", message: "worker 已启动" });
+const ORT = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/";
+let pipeline = null, env = null;
+async function initLib(plainWasm) {
+  if (!pipeline) {
+    self.postMessage({ type: "log", message: "导入 transformers.js…" });
+    const m = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1");
+    pipeline = m.pipeline; env = m.env;
+    self.postMessage({ type: "log", message: "transformers.js 已导入" });
+  }
+  env.allowLocalModels = false;
+  env.useBrowserCache = true;
+  const w = env.backends.onnx.wasm;
+  w.numThreads = 1; w.proxy = false;
+  if (plainWasm) w.wasmPaths = { mjs: ORT + "ort-wasm-simd-threaded.mjs", wasm: ORT + "ort-wasm-simd-threaded.wasm" };
+  self.postMessage({ type: "log", message: "ORT 设置：单线程，" + (plainWasm ? "精简 wasm(11MB, 非 JSEP)" : "默认 wasm") + "，SAB=" + (typeof SharedArrayBuffer !== "undefined") });
+}
 
 const RATE = 16000;
 const BLOCK = 90 * RATE; // 90 s blocks so a phone can show progress and stay memory-safe
@@ -68,10 +80,12 @@ async function loadModel(modelId, preferGpu) {
   transcriber = null;
   const attempts = [];
   if (preferGpu && (await canWebGPU())) {
+    await initLib(false);
     attempts.push({ device: "webgpu", dtype: "q8" });
   }
   // q8 is the smallest download and lowest memory for whisper (q4 files are larger for tiny/base).
-  attempts.push({ device: "wasm", dtype: { encoder_model: "q8", decoder_model_merged: "q8" } });
+  attempts.push({ device: "wasm", plain: true, dtype: { encoder_model: "q8", decoder_model_merged: "q8" } });
+  attempts.push({ device: "wasm", plain: false, dtype: { encoder_model: "q8", decoder_model_merged: "q8" } });
 
   let lastErr;
   for (const opt of attempts) {
@@ -82,11 +96,14 @@ async function loadModel(modelId, preferGpu) {
         status: "starting",
         file: `${modelId} · ${opt.device}`,
       });
+      await initLib(!!opt.plain);
+      post({ type: "log", message: "创建识别管线（初始化 WASM 引擎）…" });
       transcriber = await pipeline("automatic-speech-recognition", modelId, {
         device: opt.device,
         dtype: opt.dtype,
         progress_callback: progressCb("download"),
       });
+      post({ type: "log", message: "识别管线就绪" + (opt.plain ? "（精简 wasm）" : "") });
       loaded = { modelId, device: opt.device, dtype: typeof opt.dtype === 'string' ? opt.dtype : 'q8' };
       post({ type: "ready", ...loaded });
       return;
