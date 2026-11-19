@@ -385,36 +385,56 @@ function toSentenceSegments(segments) {
 }
 
 /* ---------------- translation ---------------- */
-async function translateOne(text) {
-  const url = "https://api.mymemory.translated.net/get?" + new URLSearchParams({ q: text, langpair: "it|zh-CN" });
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  const data = await resp.json();
-  let zh = ((data.responseData || {}).translatedText || "").trim();
-  if (zh.includes("MYMEMORY WARNING")) zh = "";
-  return zh;
-}
+let toSimp = (x) => x;
+try { if (window.OpenCC) toSimp = OpenCC.Converter({ from: "tw", to: "cn" }); } catch (e) {}
+const okZh = (z) => !!z && CJK_RE.test(z);
 
+async function googleBatch(lines) {
+  const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=it&tl=zh-CN&dt=t&q=" + encodeURIComponent(lines.join("\n"));
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("Google HTTP " + r.status);
+  const d = await r.json();
+  const full = (d[0] || []).map((x) => x[0] || "").join("");
+  const out = full.split("\n").map((x) => x.trim());
+  if (out.length !== lines.length) throw new Error("行数不一致");
+  return out;
+}
+async function myMemory(text) {
+  const url = "https://api.mymemory.translated.net/get?" + new URLSearchParams({ q: text, langpair: "it|zh-CN" });
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const d = await r.json();
+  const z = ((d.responseData || {}).translatedText || "").trim();
+  return z.includes("MYMEMORY WARNING") ? "" : z;
+}
+async function translateOne(text) {
+  try { const [z] = await googleBatch([text]); if (okZh(z)) return toSimp(z); } catch (e) {}
+  try { const z = await myMemory(text); if (okZh(z)) return toSimp(z); } catch (e) {}
+  return "";
+}
+/* Batches of ~8 neighbouring sentences go to Google in one request (context + fewer calls);
+   anything empty/English is retried per line, then via MyMemory. Output forced to Simplified. */
 async function translateSentences(texts, onEach) {
-  const out = [];
-  let method = "MyMemory API it|zh-CN";
-  let ok = 0;
-  for (let i = 0; i < texts.length; i++) {
+  const out = new Array(texts.length).fill("");
+  let google = 0, mm = 0;
+  const B = 8;
+  for (let i = 0; i < texts.length; i += B) {
     if (cancelled) throw new Error("已取消");
-    let zh = "";
-    try { zh = await translateOne(texts[i]); } catch (e) { zh = ""; }
-    if (!CJK_RE.test(zh)) zh = zh && !/^[A-Za-z0-9 .,!?'’“”:-]+$/.test(zh) ? zh : "";
-    // Accept CJK; drop pure-Latin fallbacks (MyMemory sometimes returns English)
-    if (CJK_RE.test(zh)) ok++;
-    else zh = CJK_RE.test(zh) ? zh : (zh && CJK_RE.test(zh) ? zh : (CJK_RE.test(zh) ? zh : (zh && /[\u4e00-\u9fff]/.test(zh) ? zh : "")));
-    // simplify: keep only if it has CJK
-    if (!CJK_RE.test(zh)) zh = "";
-    out.push(zh);
-    if (onEach) onEach(i + 1, texts.length, zh);
-    if (i < texts.length - 1) await sleep(120);
+    const batch = texts.slice(i, i + B);
+    try {
+      const res = await googleBatch(batch);
+      res.forEach((z, k) => { if (okZh(z)) { out[i + k] = toSimp(z); google++; } });
+    } catch (e) { dbg("Google 批量翻译失败：" + e.message); }
+    for (let k = 0; k < batch.length; k++) {
+      if (out[i + k]) continue;
+      try { const z = await myMemory(batch[k]); if (okZh(z)) { out[i + k] = toSimp(z); mm++; } } catch (e) {}
+      await sleep(120);
+    }
+    if (onEach) onEach(Math.min(texts.length, i + B), texts.length);
+    await sleep(300);
   }
-  if (ok === 0) method = "none (translation failed)";
-  else if (ok < texts.length) method = "MyMemory API it|zh-CN (partial)";
+  const ok = out.filter(Boolean).length;
+  const method = ok ? `Google ${google} + MyMemory ${mm}（已转简体）` : "none (translation failed)";
   return { zh: out, method, ok };
 }
 
@@ -481,6 +501,11 @@ async function processFile(file) {
     setWork("无法提取音频", "请改用 MP3/M4A 音频，或在相册里把视频导出为较小的文件再试。\n" + ((e && e.message) || e), 0);
     return;
   }
+  let videoBlob = null;
+  if ((file.type || "").startsWith("video/") || /\.(mp4|mov|m4v|webm)$/i.test(file.name || "")) {
+    if (file.size > 300 * 1048576) workLog("视频超过 300 MB，只保存音频（避免占满手机存储）。");
+    else { videoBlob = file; if (file.size > 80 * 1048576) workLog("提示：视频较大（" + fmtBytes(file.size) + "），会占用较多手机存储。"); }
+  }
   file = null;
   const pcm = decoded.pcm;
   if (decoded.duration > 10 * 60) workLog("提示：超过 10 分钟，手机上会很慢、可能被系统关闭页面。建议先剪短。");
@@ -489,7 +514,7 @@ async function processFile(file) {
   const audioBlob = encodeMp3(pcm) || encodeWav(pcm);
   const job = {
     title: (decodedTitle || "意大利语跟读"), createdAt: Date.now(), duration: decoded.duration,
-    audio: audioBlob, audioMime: audioBlob.type, model: modelSel.value, segments: [], doneSec: 0,
+    audio: audioBlob, audioMime: audioBlob.type, video: videoBlob, model: modelSel.value, segments: [], doneSec: 0,
   };
   await saveJob(job);
   dbg("已保存可续做的进度（释放音频内存后再加载模型）");
@@ -562,7 +587,7 @@ async function runJob(job) {
   const lesson = {
     id: "L" + Date.now().toString(36), title: job.title, createdAt: job.createdAt, duration: job.duration,
     model: modelId, device: ready.device, dtype: ready.dtype, translationMethod: tr.method, transcribeMs,
-    audioMime: job.audioMime, audio: job.audio,
+    audioMime: job.audioMime, audio: job.audio, video: job.video || null,
     sentences: sentences.map((s, i) => ({ i, start: Math.round(s.start * 1000) / 1000, end: Math.round(s.end * 1000) / 1000, it: s.text, zh: tr.zh[i] || "" })),
   };
   await putLesson(lesson);
@@ -636,8 +661,13 @@ async function openLesson(id, preloaded) {
   if (!lesson) { alert("找不到这堂课"); return; }
   currentLesson = lesson;
   if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
-  currentAudioUrl = lesson.audio ? URL.createObjectURL(lesson.audio) : "";
-  $("orig").src = currentAudioUrl || "";
+  const media = lesson.video || lesson.audio;
+  currentAudioUrl = media ? URL.createObjectURL(media) : "";
+  $("vbox").hidden = !lesson.video;
+  $("vid").onloadedmetadata = () => window.dispatchEvent(new Event("resize"));
+  $("btnSubMode").hidden = !lesson.video;
+  $("orig").removeAttribute("src"); $("vid").removeAttribute("src");
+  (lesson.video ? $("vid") : $("orig")).src = currentAudioUrl || "";
   $("playerTitle").textContent = lesson.title || "意大利语跟读";
   $("playerMeta").textContent = [
     (lesson.sentences || []).length + " 句",
@@ -653,7 +683,19 @@ function attachPlayer(lesson, audioSrc) {
   const sentences = lesson.sentences || [];
   const storageKey = "miraa:" + (lesson.id || "lesson");
   const listEl = $("list");
-  const orig = $("orig");
+  const orig = lesson.video ? $("vid") : $("orig");
+  const subIt = document.querySelector("#sub .sit"), subZh = document.querySelector("#sub .szh");
+  const SUBMODES = ["双语", "意大利语", "中文", "关闭"];
+  let subMode = 0;
+  try { subMode = Number(localStorage.getItem("miraa-submode") || 0) % 4; } catch (e) {}
+  const btnSubMode = $("btnSubMode");
+  btnSubMode.textContent = "字幕：" + SUBMODES[subMode];
+  function showSub(t) {
+    if (!lesson.video) return;
+    let s = sentences.find((x) => t >= x.start - 0.05 && t < x.end + 0.05) || null;
+    subIt.textContent = s && (subMode === 0 || subMode === 1) ? s.it : "";
+    subZh.textContent = s && (subMode === 0 || subMode === 2) ? s.zh : "";
+  }
   const mine = $("mine");
   const pbar = $("pbar");
   const nowIt = $("nowIt");
@@ -689,6 +731,8 @@ function attachPlayer(lesson, audioSrc) {
   function layoutBar() {
     $("bar").style.display = "block";
     document.documentElement.style.setProperty("--bar-h", $("bar").offsetHeight + "px");
+    document.documentElement.style.scrollPaddingTop = ($("playerHead").offsetHeight + 8) + "px";
+    document.documentElement.style.scrollPaddingBottom = ($("bar").offsetHeight + 8) + "px";
   }
   function save() {
     state.last = idx;
@@ -716,7 +760,7 @@ function attachPlayer(lesson, audioSrc) {
         '<div class="s-top"><span class="idx"></span><button type="button" class="star" aria-label="收藏"></button></div>' +
         '<div class="it"></div><div class="zh"></div>' +
         '<div class="hide-note">译文已隐藏，点「显示译文」查看</div>' +
-        '<div class="rec-row"><button type="button" class="play-mine">播放我的录音</button>' +
+        '<div class="rec-row"><button type="button" class="edit">编辑原文</button><button type="button" class="play-mine">播放我的录音</button>' +
         '<button type="button" class="cmp">对比：先原音再我的</button></div>';
       el.querySelector(".idx").textContent = (i + 1) + " / " + sentences.length + " · " + fmt(s.start);
       el.querySelector(".star").textContent = isFav(i) ? "★" : "☆";
@@ -729,6 +773,16 @@ function attachPlayer(lesson, audioSrc) {
       el.addEventListener("click", () => select(i, { play: true, scroll: false }));
       el.querySelector(".star").addEventListener("click", (e) => toggleFav(i, e));
       el.querySelector(".play-mine").addEventListener("click", (e) => { e.stopPropagation(); playMine(i); });
+      el.querySelector(".edit").addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const nt = prompt("修改这句意大利语（保存后会重新翻译）：", s.it);
+        if (nt == null || !nt.trim() || nt.trim() === s.it) return;
+        s.it = nt.trim();
+        s.zh = "翻译中…"; renderList();
+        s.zh = await translateOne(s.it);
+        try { await putLesson(lesson); } catch (er) {}
+        renderList(); if (i === idx) nowIt.textContent = s.it;
+      });
       el.querySelector(".cmp").addEventListener("click", (e) => { e.stopPropagation(); compare(i); });
       frag.appendChild(el);
     });
@@ -747,6 +801,7 @@ function attachPlayer(lesson, audioSrc) {
     idx = i;
     save();
     nowIt.textContent = sentences[i].it || "";
+    showSub(sentences[i].start + 0.01);
     document.querySelectorAll("#list .sentence").forEach((el) => {
       el.classList.toggle("current", Number(el.dataset.i) === i);
     });
@@ -794,6 +849,7 @@ function attachPlayer(lesson, audioSrc) {
   }
 
   function onTime() {
+    showSub(orig.currentTime);
     const s = sentences[idx];
     if (!s || !playing) return;
     const start = s.start;
@@ -823,6 +879,7 @@ function attachPlayer(lesson, audioSrc) {
     else { playing = false; syncPlayBtn(); }
   }
   on(orig, "timeupdate", onTime);
+  on(btnSubMode, "click", () => { subMode = (subMode + 1) % 4; btnSubMode.textContent = "字幕：" + SUBMODES[subMode]; try { localStorage.setItem("miraa-submode", subMode); } catch (e) {} showSub(orig.currentTime); });
   on(orig, "ended", onEnded);
   on(btnPlay, "click", () => { if (playing) pauseAll(); else playCurrent(); });
   on($("btnPrev"), "click", () => select(favOnly ? nearestFav(idx, -1) : idx - 1, { play: true, scroll: true }));
@@ -944,7 +1001,16 @@ async function exportCurrentLesson() {
     audio_src: audioSrc,
     audio_mime: L.audioMime || "",
   };
-  const html = EXPORT_TEMPLATE.replace("__LESSON_JSON__", JSON.stringify(payload));
+  let html = EXPORT_TEMPLATE.replace("__LESSON_JSON__", JSON.stringify(payload));
+  if (L.video && L.video.size < 50 * 1048576) {
+    payload.audio_src = "data:" + (L.video.type || "video/mp4") + ";base64," + (await blobToBase64(L.video));
+    html = EXPORT_TEMPLATE.replace("__LESSON_JSON__", JSON.stringify(payload))
+      .replace('<audio id="orig" playsinline></audio>', "")
+      .replace("<main>", '<div style="position:sticky;top:0;z-index:25;background:#000"><video id="orig" playsinline style="display:block;width:100%;max-height:34vh"></video><div id="xsub" style="position:absolute;left:6px;right:6px;bottom:8px;text-align:center;pointer-events:none;color:#fff;text-shadow:0 0 4px #000,0 0 4px #000;font-weight:600"></div></div><main>')
+      .replace("</script></body>", 'document.getElementById("orig").addEventListener("timeupdate",function(){var t=this.currentTime,s=(LESSON.sentences||[]).find(function(x){return t>=x.start&&t<x.end});document.getElementById("xsub").innerHTML=s?(s.it.replace(/</g,"&lt;")+"<br><span style=\'color:#ffe7a8;font-weight:400\'>"+(s.zh||"").replace(/</g,"&lt;")+"</span>"):""});\n</script></body>');
+  } else if (L.video) {
+    alert("视频大于 50 MB，导出文件只包含音频。");
+  }
   const safe = (L.title || "lesson").replace(/[^\w\u4e00-\u9fff\-]+/g, "_").slice(0, 60) || "lesson";
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([html], { type: "text/html;charset=utf-8" }));
