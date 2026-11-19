@@ -3,6 +3,7 @@ import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transfo
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
+try { env.backends.onnx.wasm.numThreads = 1; env.backends.onnx.wasm.proxy = false; } catch (e) {}
 
 const RATE = 16000;
 const BLOCK = 90 * RATE; // 90 s blocks so a phone can show progress and stay memory-safe
@@ -172,6 +173,11 @@ self.onmessage = async (ev) => {
       await loadModel(msg.modelId, msg.preferGpu !== false);
     } else if (msg.type === "transcribe") {
       await transcribe(msg.audio);
+    } else if (msg.type === "chunk") {
+      if (!transcriber) throw new Error("模型尚未加载");
+      const pcm = msg.audio;
+      const r = await transcriber(pcm, { language: "italian", task: "transcribe", return_timestamps: true, chunk_length_s: 30 });
+      post({ type: "chunkResult", segments: chunksFrom(r, msg.offset || 0, pcm.length / RATE) });
     } else if (msg.type === "ping") {
       post({ type: "pong" });
     }

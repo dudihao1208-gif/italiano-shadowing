@@ -71,7 +71,8 @@ const getRec = (key) => idbOp("recordings", "readonly", (s) => s.get(key));
 async function refreshLibrary() {
   const box = $("libList");
   let items = [];
-  try { items = (await listLessons()) || []; } catch (e) { items = []; }
+  try { items = (await listLessons()) || [];
+  items = items.filter((x) => x.id !== JOB_ID); } catch (e) { items = []; }
   items.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   box.innerHTML = "";
   if (!items.length) {
@@ -148,20 +149,108 @@ function resampleLinear(input, fromRate, toRate) {
   return out;
 }
 
-async function decodeTo16kMono(file) {
-  const raw = await file.arrayBuffer();
-  const copy = raw.slice(0);
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+/* ---------------- persistent debug log ---------------- */
+const DBG_KEY = "miraa-debug";
+function dbg(step) {
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem(DBG_KEY) || "[]"); } catch (e) {}
+  const t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  let mem = "";
+  try { if (performance.memory) mem = " mem=" + Math.round(performance.memory.usedJSHeapSize / 1048576) + "MB"; } catch (e) {}
+  arr.push(`[${t}] ${step}${mem}`);
+  arr = arr.slice(-60);
+  try { localStorage.setItem(DBG_KEY, JSON.stringify(arr)); } catch (e) {}
+  renderDebug();
+}
+function renderDebug() {
+  const el = document.getElementById("debugLog");
+  if (!el) return;
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem(DBG_KEY) || "[]"); } catch (e) {}
+  el.textContent = arr.length ? arr.join("\n") : "（暂无记录）";
+}
+
+async function decodeArrayBuffer(ab) {
   const Ctx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new Ctx({ sampleRate: RATE });
-  let buf;
+  const ctx = new Ctx(); // default rate: iOS is unreliable with custom sampleRate
   try {
-    buf = await ctx.decodeAudioData(copy);
+    return await new Promise((resolve, reject) => {
+      const p = ctx.decodeAudioData(ab, resolve, reject);
+      if (p && p.then) p.then(resolve, reject);
+    });
   } finally {
     try { await ctx.close(); } catch (e) {}
   }
-  const mixed = mixMono(buf);
-  const data = resampleLinear(mixed.data, mixed.sampleRate, RATE);
-  return { pcm: data, duration: data.length / RATE, sourceRate: mixed.sampleRate };
+}
+
+/* Fallback: play the media muted-to-speakers through a <video> element and capture samples. */
+async function captureViaMediaElement(file, onProgress) {
+  const url = URL.createObjectURL(file);
+  const media = document.createElement("video");
+  media.playsInline = true;
+  media.setAttribute("playsinline", "");
+  media.preload = "auto";
+  media.src = url;
+  await new Promise((res, rej) => {
+    media.onloadedmetadata = res;
+    media.onerror = () => rej(new Error("浏览器无法读取这个视频"));
+  });
+  const dur = media.duration;
+  if (!isFinite(dur) || dur <= 0) throw new Error("无法读取时长");
+  if (dur > 15 * 60) throw new Error("视频超过 15 分钟，手机上无法实时提取");
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  const src = ctx.createMediaElementSource(media);
+  const proc = ctx.createScriptProcessor(4096, 2, 1);
+  const parts = [];
+  proc.onaudioprocess = (e) => {
+    const ib = e.inputBuffer;
+    const n = ib.length, ch = ib.numberOfChannels;
+    const m = new Float32Array(n);
+    for (let c = 0; c < ch; c++) { const d = ib.getChannelData(c); for (let i = 0; i < n; i++) m[i] += d[i] / ch; }
+    parts.push(resampleLinear(m, ctx.sampleRate, RATE));
+    if (onProgress) onProgress(media.currentTime / dur);
+  };
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  await ctx.resume();
+  await media.play();
+  await new Promise((res) => { media.onended = res; });
+  proc.disconnect(); src.disconnect();
+  try { await ctx.close(); } catch (e) {}
+  URL.revokeObjectURL(url);
+  let len = 0; parts.forEach((p) => (len += p.length));
+  const out = new Float32Array(len); let o = 0;
+  parts.forEach((p) => { out.set(p, o); o += p.length; });
+  return out;
+}
+
+async function decodeTo16kMono(file, onProgress) {
+  dbg("解码开始：" + (file.type || "?") + " " + fmtBytes(file.size));
+  let buf = null;
+  try {
+    let ab = await file.arrayBuffer();
+    dbg("已读入文件");
+    buf = await decodeArrayBuffer(ab);
+    ab = null;
+    dbg(`decodeAudioData 成功 ${buf.sampleRate}Hz ${buf.numberOfChannels}声道`);
+  } catch (e) {
+    dbg("decodeAudioData 失败：" + ((e && e.message) || e) + "，改用视频播放提取");
+    buf = null;
+  }
+  if (buf) {
+    const ch = buf.numberOfChannels, n = buf.length, rate = buf.sampleRate;
+    const mono = new Float32Array(n);
+    for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) mono[i] += d[i] / ch; }
+    buf = null;
+    const pcm = resampleLinear(mono, rate, RATE);
+    return { pcm, duration: pcm.length / RATE, sourceRate: rate };
+  }
+  const pcm = await captureViaMediaElement(file, onProgress);
+  dbg("视频播放提取完成");
+  return { pcm, duration: pcm.length / RATE, sourceRate: RATE };
 }
 
 function encodeWav(pcm, sampleRate = RATE) {
@@ -342,169 +431,135 @@ function waitWorker(onProgress) {
     const handle = (ev) => {
       const msg = ev.data || {};
       if (msg.type === "progress" || msg.type === "log") {
+        if (msg.type === "log") dbg("worker: " + msg.message);
         if (onProgress) onProgress(msg);
         return;
       }
-      if (msg.type === "ready" || msg.type === "result") {
-        w.removeEventListener("message", handle);
-        resolve(msg);
-      } else if (msg.type === "error") {
-        w.removeEventListener("message", handle);
-        reject(new Error(msg.message || "识别失败"));
-      }
+      w.removeEventListener("message", handle);
+      if (msg.type === "error") reject(new Error(msg.message || "识别失败"));
+      else resolve(msg);
     };
     w.addEventListener("message", handle);
+    w.onerror = (e) => { w.removeEventListener("message", handle); reject(new Error("识别线程崩溃：" + (e.message || ""))); };
   });
 }
 
 async function loadModel(modelId, onProgress) {
   const w = ensureWorker();
   const p = waitWorker(onProgress);
-  w.postMessage({ type: "load", modelId, preferGpu: true });
+  w.postMessage({ type: "load", modelId, preferGpu: !IS_IOS });
   return p;
 }
 
-async function runTranscribe(pcm, onProgress) {
+async function transcribeChunk(pcmChunk, offset) {
   const w = ensureWorker();
-  const p = waitWorker(onProgress);
-  w.postMessage({ type: "transcribe", audio: pcm }, [pcm.buffer]);
+  const p = waitWorker();
+  w.postMessage({ type: "chunk", audio: pcmChunk, offset }, [pcmChunk.buffer]);
   return p;
 }
 
-/* ---------------- pipeline ---------------- */
+/* ---- resumable job (IndexedDB "lessons" store, id "__job__") ---- */
+const JOB_ID = "__job__";
+async function saveJob(job) { try { await putLesson({ ...job, id: JOB_ID }); } catch (e) { dbg("保存进度失败：" + e.message); } }
+async function clearJob() { try { await delLesson(JOB_ID); } catch (e) {} }
+
 async function processFile(file) {
   cancelled = false;
   showView("work");
   $("workLog").textContent = "";
-  setWork("正在读取文件…", file.name || "未命名", 2);
-  workLog("文件：" + (file.name || "") + " · " + fmtBytes(file.size));
-
-  let pcm, duration;
+  try { localStorage.setItem(DBG_KEY, "[]"); } catch (e) {}
+  dbg("选择文件：" + (file.name || "") + " " + fmtBytes(file.size) + (IS_IOS ? " (iOS)" : ""));
+  setWork("正在提取音频…", file.name || "", 5);
+  let decoded;
   try {
-    setWork("正在提取音频…", "解码并重采样为 16 kHz 单声道", 8);
-    const decoded = await decodeTo16kMono(file);
-    pcm = decoded.pcm;
-    duration = decoded.duration;
-    workLog(`音频时长 ${fmtDur(duration)}，采样率已转为 16 kHz 单声道（原 ${Math.round(decoded.sourceRate)} Hz）`);
-    if (duration > 12 * 60) {
-      workLog("文件较长，手机上识别会比较慢。建议先截成几分钟再导入。");
-    }
+    decoded = await decodeTo16kMono(file, (f) => setWork("正在提取音频…", "通过播放视频提取声音（需要与视频等长的时间）", 5 + f * 15));
   } catch (e) {
-    setWork("无法提取音频", (e && e.message) || String(e), 0);
-    workLog("解码失败。请试试 MP3、M4A、WAV，或先把视频导出成音频。");
-    workLog(String(e && e.message ? e.message : e));
+    dbg("提取失败：" + ((e && e.message) || e));
+    setWork("无法提取音频", "请改用 MP3/M4A 音频，或在相册里把视频导出为较小的文件再试。\n" + ((e && e.message) || e), 0);
     return;
   }
-  if (cancelled) return;
+  file = null;
+  const pcm = decoded.pcm;
+  if (decoded.duration > 10 * 60) workLog("提示：超过 10 分钟，手机上会很慢、可能被系统关闭页面。建议先剪短。");
+  workLog(`音频 ${fmtDur(decoded.duration)}`);
+  dbg("音频长度 " + decoded.duration.toFixed(1) + "s，压缩保存中");
+  const audioBlob = encodeMp3(pcm) || encodeWav(pcm);
+  const job = {
+    title: (decodedTitle || "意大利语跟读"), createdAt: Date.now(), duration: decoded.duration,
+    audio: audioBlob, audioMime: audioBlob.type, model: modelSel.value, segments: [], doneSec: 0,
+  };
+  await saveJob(job);
+  dbg("已保存可续做的进度");
+  await runJob(job, pcm);
+}
+let decodedTitle = "";
 
-  const modelId = modelSel.value;
+async function resumeJob() {
+  const job = await getLesson(JOB_ID);
+  if (!job) return;
+  showView("work");
+  dbg(`继续上次：已完成 ${Math.round(job.doneSec)}s / ${Math.round(job.duration)}s`);
+  let pcm;
+  try {
+    pcm = (await decodeTo16kMono(new File([job.audio], "job.mp3", { type: job.audioMime }))).pcm;
+  } catch (e) { setWork("无法继续", String(e.message || e), 0); return; }
+  await runJob(job, pcm);
+}
+
+async function runJob(job, pcm) {
+  const modelId = job.model || "onnx-community/whisper-tiny";
   const meta = MODELS[modelId] || { label: modelId, downloadMB: "?" };
-  setWork("正在加载语音识别模型…", `首次需要下载约 ${meta.downloadMB} MB（${meta.label}），之后可走缓存`, 12);
+  setWork("正在加载语音识别模型…", `首次需要下载约 ${meta.downloadMB} MB`, 20);
+  dbg("加载模型 " + modelId);
   let ready;
   try {
     ready = await loadModel(modelId, (msg) => {
-      if (cancelled) return;
-      if (msg.type === "log") { workLog(msg.message); return; }
-      const fileName = (msg.file || "").split("/").pop();
-      if (msg.phase === "download") {
-        const pct = 12 + Math.round((msg.pct || 0) * 0.25);
-        const detail = msg.total
-          ? `正在下载 ${fileName || "模型"} ${fmtBytes(msg.loaded)} / ${fmtBytes(msg.total)}`
-          : (msg.status === "done" ? `已就绪 ${fileName}` : `加载中… ${fileName || ""}`);
-        setWork("正在加载语音识别模型…", detail, pct);
+      if (msg.phase === "download" && msg.total) {
+        setWork("正在加载语音识别模型…", `下载 ${(msg.file || "").split("/").pop()} ${fmtBytes(msg.loaded)} / ${fmtBytes(msg.total)}`, 20 + (msg.pct || 0) * 0.2);
       }
     });
-    workLog(`模型就绪：${ready.modelId} · 设备 ${ready.device} · 精度 ${ready.dtype}`);
+    dbg(`模型就绪 ${ready.device}/${ready.dtype}`);
   } catch (e) {
-    setWork("模型加载失败", (e && e.message) || String(e), 0);
-    workLog(String(e && e.message ? e.message : e));
+    dbg("模型加载失败：" + e.message);
+    setWork("模型加载失败", e.message, 0);
     return;
   }
-  if (cancelled) return;
-
-  setWork("正在识别意大利语…", "请不要锁屏，识别在本地进行", 40);
+  const CH = 30 * RATE;
+  const total = pcm.length;
   const t0 = performance.now();
-  let result;
-  try {
-    // postMessage transfers the buffer, so keep a copy for encoding later
-    const pcmCopy = pcm.slice(0);
-    result = await runTranscribe(pcm, (msg) => {
-      if (cancelled) return;
-      if (msg.type === "log") { workLog(msg.message); return; }
-      if (msg.phase === "transcribe") {
-        const pct = 40 + Math.round((msg.pct || 0) * 0.35);
-        const extra = msg.doneSec != null ? `已处理 ${fmtDur(msg.doneSec)} / ${fmtDur(msg.totalSec)}` : "识别中…";
-        setWork("正在识别意大利语…", extra, pct);
-      }
-    });
-    pcm = pcmCopy;
-  } catch (e) {
-    setWork("识别失败", (e && e.message) || String(e), 0);
-    workLog(String(e && e.message ? e.message : e));
-    return;
+  for (let start = Math.round(job.doneSec * RATE); start < total; start += CH) {
+    if (cancelled) return;
+    const end = Math.min(total, start + CH);
+    setWork("正在识别意大利语…", `已处理 ${fmtDur(start / RATE)} / ${fmtDur(total / RATE)}`, 40 + (start / total) * 38);
+    dbg(`识别 ${Math.round(start / RATE)}–${Math.round(end / RATE)}s`);
+    let res;
+    try { res = await transcribeChunk(pcm.slice(start, end), start / RATE); }
+    catch (e) { dbg("识别失败：" + e.message); setWork("识别失败", e.message + "（可返回后点「继续上次」）", 0); return; }
+    job.segments.push(...(res.segments || []));
+    job.doneSec = end / RATE;
+    await saveJob(job);
   }
   const transcribeMs = performance.now() - t0;
-  const segs = result.segments || [];
-  workLog(`识别完成：${segs.length} 段，用时 ${(transcribeMs / 1000).toFixed(1)} 秒（约 ${duration ? ((transcribeMs / 1000) / (duration / 60)).toFixed(1) : "?"} 秒/分钟音频）`);
-  if (cancelled) return;
-
-  const sentences = toSentenceSegments(segs);
-  workLog(`合并为 ${sentences.length} 个句子`);
-  if (!sentences.length) {
-    setWork("没有识别出句子", "可以换一个更清晰的录音，或改用「较准」模型再试。", 0);
-    return;
-  }
-
-  setWork("正在翻译成中文…", `0 / ${sentences.length}`, 78);
-  let zh = [], method = "none";
+  dbg(`识别完成 ${job.segments.length} 段`);
+  const sentences = toSentenceSegments(job.segments);
+  setWork("正在翻译成中文…", `0 / ${sentences.length}`, 80);
+  let tr = { zh: sentences.map(() => ""), method: "none", ok: 0 };
   try {
-    const tr = await translateSentences(sentences.map((s) => s.text), (i, n) => {
-      setWork("正在翻译成中文…", `${i} / ${n}`, 78 + Math.round((i / n) * 18));
-    });
-    zh = tr.zh;
-    method = tr.method;
-    workLog(`翻译：${method}，成功 ${tr.ok}/${sentences.length}`);
-  } catch (e) {
-    workLog("翻译失败，将只保留意大利语：" + ((e && e.message) || e));
-    zh = sentences.map(() => "");
-    method = "none (translation failed)";
-  }
-  if (cancelled) return;
-
-  setWork("正在保存课程…", "写入本机（可离线打开）", 97);
-  const audioBlob = await playbackBlob(file, pcm);
-  const id = "L" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const title = (file.name || "意大利语跟读").replace(/\.[^.]+$/, "");
+    tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 80 + (i / n) * 17));
+  } catch (e) { dbg("翻译失败：" + e.message); }
+  dbg(`翻译 ${tr.ok}/${sentences.length}`);
   const lesson = {
-    id,
-    title,
-    createdAt: Date.now(),
-    duration: result.duration || duration,
-    sourceName: file.name || "",
-    model: ready.modelId,
-    device: ready.device,
-    dtype: ready.dtype,
-    translationMethod: method,
-    transcribeMs,
-    audioMime: audioBlob.type || "audio/mpeg",
-    audio: audioBlob,
-    sentences: sentences.map((s, i) => ({
-      i,
-      start: Math.round(s.start * 1000) / 1000,
-      end: Math.round(s.end * 1000) / 1000,
-      it: s.text,
-      zh: zh[i] || "",
-    })),
+    id: "L" + Date.now().toString(36), title: job.title, createdAt: job.createdAt, duration: job.duration,
+    model: modelId, device: ready.device, dtype: ready.dtype, translationMethod: tr.method, transcribeMs,
+    audioMime: job.audioMime, audio: job.audio,
+    sentences: sentences.map((s, i) => ({ i, start: Math.round(s.start * 1000) / 1000, end: Math.round(s.end * 1000) / 1000, it: s.text, zh: tr.zh[i] || "" })),
   };
-  try {
-    await putLesson(lesson);
-    workLog("已保存到本机 IndexedDB，下次打开这个网站即可离线回看。");
-  } catch (e) {
-    workLog("保存失败（可能是存储空间不足）：" + ((e && e.message) || e));
-  }
-  setWork("完成", `${lesson.sentences.length} 句 · ${fmtDur(lesson.duration)}`, 100);
+  await putLesson(lesson);
+  await clearJob();
+  dbg("课程已保存，完成");
   await openLesson(lesson.id, lesson);
 }
+
 
 /* ---------------- player ---------------- */
 function fmt(t) {
@@ -1029,7 +1084,7 @@ function boot() {
   filePick.addEventListener("change", () => {
     const f = filePick.files && filePick.files[0];
     filePick.value = "";
-    if (f) processFile(f);
+    if (f) { decodedTitle = (f.name || "意大利语跟读").replace(/\.[^.]+$/, ""); processFile(f); }
   });
   $("btnCancelWork").addEventListener("click", () => {
     cancelled = true;
@@ -1046,6 +1101,15 @@ function boot() {
     refreshLibrary();
   });
   $("btnExport").addEventListener("click", () => exportCurrentLesson());
+  renderDebug();
+  $("btnClearDbg").addEventListener("click", () => { localStorage.setItem(DBG_KEY, "[]"); renderDebug(); });
+  getLesson(JOB_ID).then((j) => {
+    if (j) { $("resumeBox").hidden = false; $("resumeInfo").textContent = `「${j.title}」已识别 ${Math.round(j.doneSec)} / ${Math.round(j.duration)} 秒`; }
+  }).catch(() => {});
+  $("btnResume").addEventListener("click", () => resumeJob());
+  $("btnDropJob").addEventListener("click", async () => { await clearJob(); $("resumeBox").hidden = true; });
+  window.addEventListener("error", (e) => dbg("JS错误：" + e.message));
+  window.addEventListener("unhandledrejection", (e) => dbg("未处理错误：" + ((e.reason && e.reason.message) || e.reason)));
   refreshLibrary();
 
   // Expose a small hook for automated tests (localhost only).

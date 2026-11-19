@@ -204,8 +204,17 @@
       <button type="button" class="primary" id="btnPick">从手机选择音视频</button>
       <input id="filePick" class="hidden-file" type="file" accept="audio/*,video/*,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac,.mp4,.mov,.webm,.mkv">
     </div>
+    <div id="resumeBox" class="warn" hidden>
+      上次的处理没有完成（页面可能被系统重新加载）。<span id="resumeInfo"></span>
+      <p style="display:flex;gap:8px;margin:8px 0 0"><button type="button" id="btnResume">继续上次</button><button type="button" id="btnDropJob">放弃</button></p>
+    </div>
     <h2 style="font-size:.95rem;margin:18px 0 8px;">已保存的课</h2>
     <div id="libList"></div>
+    <details class="card" style="margin-top:18px" open>
+      <summary style="font-size:.85rem">调试记录（页面重载后仍保留，出问题时请截图）</summary>
+      <pre id="debugLog" style="white-space:pre-wrap;font-size:.72rem;color:#6b6458;margin:8px 0"></pre>
+      <button type="button" id="btnClearDbg">清空记录</button>
+    </details>
   </section>
 
   <section id="viewWork" class="view">
@@ -215,6 +224,7 @@
     <div class="bar"><span id="workBar"></span></div>
     <div id="workPct">0%</div>
     <div id="workLog"></div>
+    <pre id="debugLog2" hidden></pre>
     <p style="text-align:center;margin-top:20px">
       <button type="button" id="btnCancelWork">取消并返回</button>
     </p>
