@@ -207,8 +207,9 @@
       <select id="modelSel" class="field">
         <option value="onnx-community/whisper-tiny" selected>快速 · whisper-tiny（约 43 MB，推荐手机）</option>
         <option value="onnx-community/whisper-base">较准 · whisper-base（约 77 MB，更慢）</option>
+        <option value="onnx-community/whisper-small">最准 · whisper-small（约 242 MB，实验，可能刷新）</option>
       </select>
-      <label id="bigWrap" hidden style="display:flex;gap:8px;align-items:center;font-size:.88rem;margin:-4px 0 10px"><input type="checkbox" id="bigToggle"> 试用大模型（whisper-base，约77MB，更准，可能让页面刷新）</label>
+      <label id="bigWrap" hidden data-unused style="display:flex;gap:8px;align-items:center;font-size:.88rem;margin:-4px 0 10px"><input type="checkbox" id="bigToggle"> 试用大模型（whisper-base，约77MB，更准，可能让页面刷新）</label>
       <div id="baseCrashNote" class="warn" hidden>上次用大模型（whisper-base）时页面被刷新了：这台手机在这个浏览器里内存不够跑大模型。已自动切回快速模型（whisper-tiny）。如有未完成的课，可点下方「继续上次」用快速模型接着做。</div>
       <p class="hint">请用 <b>Safari</b> 打开本页，不要在微信、Instagram 等 App 内置浏览器里使用（内存更少，容易刷新）。</p>
       <p class="hint">识别在你的手机里完成，音视频不会上传到我们的服务器。翻译会请求免费的 MyMemory 接口；若失败，句子仍可跟读，只是没有中文。</p>

@@ -2,6 +2,7 @@
 const MODELS = {
   "onnx-community/whisper-tiny": { label: "whisper-tiny", downloadMB: 43 },
   "onnx-community/whisper-base": { label: "whisper-base", downloadMB: 77 },
+  "onnx-community/whisper-small": { label: "whisper-small", downloadMB: 242 },
 };
 const RATE = 16000;
 const CJK_RE = /[\u4e00-\u9fff]/;
@@ -151,6 +152,9 @@ function resampleLinear(input, fromRate, toRate) {
 
 const TINY = "onnx-community/whisper-tiny";
 const LOADING_KEY = "miraa-loading-model";
+const BASE = "onnx-community/whisper-base", SMALL = "onnx-community/whisper-small";
+const FALLBACK = { [SMALL]: BASE, [BASE]: TINY };
+const fallbackOf = (m) => FALLBACK[m] || TINY;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
 /* ---------------- persistent debug log ---------------- */
@@ -532,8 +536,8 @@ async function resumeJob() {
 
 async function runJob(job) {
   let modelId = job.model || TINY;
-  if (IS_IOS && modelId !== TINY && localStorage.getItem("miraa-ios-big") !== "1") { dbg("iPhone 未开启大模型，使用 whisper-tiny"); modelId = TINY; }
-  if (localStorage.getItem(LOADING_KEY) && modelId !== TINY) { dbg("上次加载模型时页面崩溃，自动改用 whisper-tiny"); modelId = TINY; }
+  const prevCrash = localStorage.getItem(LOADING_KEY);
+  if (prevCrash && prevCrash !== TINY) { const fb = fallbackOf(prevCrash); dbg(`上次用 ${prevCrash} 时页面刷新，改用 ${fb}`); modelId = fb; }
   job.model = modelId; await saveJob(job);
   try { localStorage.setItem(LOADING_KEY, modelId); } catch (e) {}
   const meta = MODELS[modelId] || { label: modelId, downloadMB: "?" };
@@ -1192,25 +1196,24 @@ function boot() {
   if (!isSecure()) $("secureNote").hidden = false;
   dbg("设备：" + navigator.userAgent.slice(0, 120) + " · deviceMemory=" + (navigator.deviceMemory || "?") + "GB · cores=" + (navigator.hardwareConcurrency || "?"));
   const crashed = localStorage.getItem(LOADING_KEY);
-  if (crashed) {
-    dbg("检测到上次用 " + crashed + " 时页面被重新加载（多半内存不足），已切换为 whisper-tiny");
-    try { localStorage.setItem("miraa-phone-model", TINY); localStorage.setItem("miraa-ios-big", "0"); } catch (e) {}
-    if (crashed !== TINY) $("baseCrashNote").hidden = false;
+  if (crashed && crashed !== TINY) {
+    const fb = fallbackOf(crashed);
+    dbg(`检测到上次用 ${crashed} 时页面被重新加载（多半内存不足），已切换为 ${fb}`);
+    try { localStorage.setItem("miraa-phone-model", fb); } catch (e) {}
+    $("baseCrashNote").textContent = `上次用「${(MODELS[crashed] || {}).label}」时页面被刷新了：这台手机在这个浏览器里内存不够。已自动换成「${MODELS[fb].label}」。如有未完成的课，可点下方「继续上次」接着做。`;
+    $("baseCrashNote").hidden = false;
   }
-  if (IS_IOS) {
-    $("bigWrap").hidden = false; $("bigWrap").style.display = "flex";
-    modelSel.closest(".card").querySelector('label[for="modelSel"]').hidden = true; modelSel.hidden = true;
-    const big = localStorage.getItem("miraa-ios-big") === "1";
-    $("bigToggle").checked = big;
-    try { localStorage.setItem("miraa-phone-model", big ? "onnx-community/whisper-base" : TINY); } catch (e) {}
-    $("bigToggle").addEventListener("change", () => {
-      const on = $("bigToggle").checked;
-      try { localStorage.setItem("miraa-ios-big", on ? "1" : "0"); } catch (e) {}
-      modelSel.value = on ? "onnx-community/whisper-base" : TINY;
-      try { localStorage.setItem("miraa-phone-model", modelSel.value); } catch (e) {}
-      dbg("大模型开关：" + (on ? "开" : "关"));
-    });
-  }
+  modelSel.addEventListener("change", () => {
+    const m = modelSel.value;
+    if (m === TINY) return;
+    const key = "miraa-confirmed-" + m;
+    if (localStorage.getItem(key)) return;
+    const info = m === SMALL
+      ? "whisper-small 约 242 MB，首次下载较久；识别速度约为 tiny 的 4–6 倍慢，手机可能发烫，内存不足时页面会刷新（会自动退回 base）。确定使用？"
+      : "whisper-base 约 77 MB，首次需下载；比 tiny 准，速度约慢 2 倍。确定使用？";
+    if (confirm(info)) localStorage.setItem(key, "1");
+    else { modelSel.value = TINY; modelSel.dispatchEvent(new Event("change")); }
+  });
   try {
     const saved = localStorage.getItem("miraa-phone-model");
     if (saved && MODELS[saved]) modelSel.value = saved;
