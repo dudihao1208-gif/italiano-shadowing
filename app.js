@@ -532,7 +532,7 @@ async function resumeJob() {
 
 async function runJob(job) {
   let modelId = job.model || TINY;
-  if (IS_IOS && modelId !== TINY) { dbg("iPhone 内存有限，改用 whisper-tiny"); modelId = TINY; }
+  if (IS_IOS && modelId !== TINY && localStorage.getItem("miraa-ios-big") !== "1") { dbg("iPhone 未开启大模型，使用 whisper-tiny"); modelId = TINY; }
   if (localStorage.getItem(LOADING_KEY) && modelId !== TINY) { dbg("上次加载模型时页面崩溃，自动改用 whisper-tiny"); modelId = TINY; }
   job.model = modelId; await saveJob(job);
   try { localStorage.setItem(LOADING_KEY, modelId); } catch (e) {}
@@ -550,7 +550,6 @@ async function runJob(job) {
       }
     });
     dbg(`模型就绪 ${ready.device}/${ready.dtype}`);
-    try { localStorage.removeItem(LOADING_KEY); } catch (e) {}
   } catch (e) {
     dbg("模型加载失败：" + e.message);
     setWork("模型加载失败", e.message, 0);
@@ -576,6 +575,7 @@ async function runJob(job) {
     await saveJob(job);
   }
   const transcribeMs = performance.now() - t0;
+  try { localStorage.removeItem(LOADING_KEY); } catch (e) {}
   dbg(`识别完成 ${job.segments.length} 段`);
   const sentences = toSentenceSegments(job.segments);
   setWork("正在翻译成中文…", `0 / ${sentences.length}`, 80);
@@ -1191,14 +1191,25 @@ const LESSON = __LESSON_JSON__;
 function boot() {
   if (!isSecure()) $("secureNote").hidden = false;
   dbg("设备：" + navigator.userAgent.slice(0, 120) + " · deviceMemory=" + (navigator.deviceMemory || "?") + "GB · cores=" + (navigator.hardwareConcurrency || "?"));
-  if (localStorage.getItem(LOADING_KEY)) {
-    dbg("检测到上次加载模型 " + localStorage.getItem(LOADING_KEY) + " 时页面被重新加载（多半内存不足），已切换为 whisper-tiny");
-    try { localStorage.setItem("miraa-phone-model", TINY); } catch (e) {}
+  const crashed = localStorage.getItem(LOADING_KEY);
+  if (crashed) {
+    dbg("检测到上次用 " + crashed + " 时页面被重新加载（多半内存不足），已切换为 whisper-tiny");
+    try { localStorage.setItem("miraa-phone-model", TINY); localStorage.setItem("miraa-ios-big", "0"); } catch (e) {}
+    if (crashed !== TINY) $("baseCrashNote").hidden = false;
   }
   if (IS_IOS) {
-    try { localStorage.setItem("miraa-phone-model", TINY); } catch (e) {}
-    const opt = modelSel.querySelector('option[value="onnx-community/whisper-base"]');
-    if (opt) { opt.disabled = true; opt.textContent += "（iPhone 内存不足，已禁用）"; }
+    $("bigWrap").hidden = false; $("bigWrap").style.display = "flex";
+    modelSel.closest(".card").querySelector('label[for="modelSel"]').hidden = true; modelSel.hidden = true;
+    const big = localStorage.getItem("miraa-ios-big") === "1";
+    $("bigToggle").checked = big;
+    try { localStorage.setItem("miraa-phone-model", big ? "onnx-community/whisper-base" : TINY); } catch (e) {}
+    $("bigToggle").addEventListener("change", () => {
+      const on = $("bigToggle").checked;
+      try { localStorage.setItem("miraa-ios-big", on ? "1" : "0"); } catch (e) {}
+      modelSel.value = on ? "onnx-community/whisper-base" : TINY;
+      try { localStorage.setItem("miraa-phone-model", modelSel.value); } catch (e) {}
+      dbg("大模型开关：" + (on ? "开" : "关"));
+    });
   }
   try {
     const saved = localStorage.getItem("miraa-phone-model");
