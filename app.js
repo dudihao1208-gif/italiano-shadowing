@@ -418,40 +418,68 @@ async function translateOne(text) {
 }
 /* ---- free no-key LLM (Pollinations, OpenAI-compatible, CORS *) ---- */
 const AI_URL = "https://text.pollinations.ai/openai";
-let aiQueue = Promise.resolve();
+let aiQueue = Promise.resolve(), lastAiAt = 0;
 function aiChat(prompt, timeoutMs) {
   const run = aiQueue.then(async () => {
-    for (let k = 0; k < 4; k++) {
+    for (let k = 0; k < 6; k++) {
+      const gap = Date.now() - lastAiAt; if (gap < 3000) await sleep(3000 - gap);
+      lastAiAt = Date.now();
       try { return await aiChatOnce(prompt, timeoutMs); }
-      catch (e) { if (!/40[29]|429|5\d\d/.test(e.message) || k === 3) throw e; dbg("AI 限流，稍后重试：" + e.message); await sleep(4000 * (k + 1)); }
+      catch (e) { if (/404/.test(e.message) && aiModel !== AI_MODELS[1]) { aiModel = AI_MODELS[1]; continue; } if (!/40[29]|429|5\d\d/.test(e.message) || k === 5) throw e; dbg("AI 限流，稍后重试：" + e.message); await sleep(5000 * (k + 1)); }
     }
   });
   aiQueue = run.catch(() => {});
   return run;
 }
+let aiModel = "openai";
 async function aiChatOnce(prompt, timeoutMs = 90000) {
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const r = await fetch(AI_URL, { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
-      body: JSON.stringify({ model: "openai", messages: [{ role: "user", content: prompt }] }) });
+      body: JSON.stringify({ model: aiModel, messages: [{ role: "user", content: prompt }] }) });
     if (!r.ok) throw new Error("AI HTTP " + r.status);
     const d = await r.json();
     return (((d.choices || [])[0] || {}).message || {}).content || "";
   } finally { clearTimeout(tm); }
 }
 function parseJsonObj(s) { const i = s.indexOf("{"), j = s.lastIndexOf("}"); if (i < 0 || j < i) throw new Error("AI 没返回 JSON"); return JSON.parse(s.slice(i, j + 1)); }
-async function aiTranslateAll(texts) {
+const AI_MODELS = ["openai", "openai-fast"];   // only gpt-oss-20b is free/anonymous on Pollinations right now
+let lastAiContext = { summary: "", glossary: [] };
+async function aiTranslateAll(texts, title) {
   const out = new Array(texts.length).fill("");
-  const B = 40;
+  const numbered = texts.map((t, k) => `${k + 1}. ${t}`);
+  const whole = numbered.join("\n");
+  const big = whole.length > 6000;
+  const transcriptForCtx = big ? numbered.slice(0, 120).join("\n") : whole;
+  // Pass 1: scene summary + glossary of ambiguous words (cheap; failure is fine)
+  let summary = "", glossary = [];
+  try {
+    const o = parseJsonObj(await aiChat(`下面是意大利语视频「${title || ""}」的语音转写（可能有识别错误）。请先理解场景。只输出 JSON：{"summary":"用一两句简体中文概括场景、说话人和语气","glossary":[{"it":"意大利语词","zh":"本语境下的中文意思","why":"为什么不是其他意思（简短）"}]}。glossary 只列多义词、俚语、地名人名和关键词，最多 15 个。\n${transcriptForCtx}`));
+    summary = String(o.summary || ""); glossary = Array.isArray(o.glossary) ? o.glossary.slice(0, 15) : [];
+    dbg("AI 场景：" + summary.slice(0, 60));
+  } catch (e) { dbg("AI 第1步（场景）失败：" + e.message); }
+  const glossTxt = glossary.map((g) => `${g.it} = ${g.zh}`).join("；");
+  // Pass 2: translate with summary + glossary + full transcript (or sliding window)
+  const B = big ? 40 : texts.length;
   for (let i = 0; i < texts.length; i += B) {
-    const ctx = texts.slice(Math.max(0, i - 3), i).map((t) => "（上文）" + t).join("\n");
-    const lines = texts.slice(i, i + B).map((t, k) => `${i + k + 1}. ${t}`).join("\n");
-    const prompt = `你是意大利语-中文字幕译者。下面是一段意大利语口语转写（可能有识别错误），请结合全文语境，把每个编号行译成自然、口语化的简体中文（不要逐词直译，注意多义词按语境，例如 campagne 在“qua ci sono solo campagne”里是田野/乡下）。只输出 JSON 对象，键是行号字符串，值是译文，不要任何解释。\n${ctx ? ctx + "\n" : ""}${lines}`;
+    const ctx = big ? numbered.slice(Math.max(0, i - 10), Math.min(texts.length, i + B + 10)).join("\n") : whole;
+    const want = `${i + 1}–${Math.min(texts.length, i + B)}`;
     try {
-      const obj = parseJsonObj(await aiChat(prompt));
-      for (let k = 0; k < Math.min(B, texts.length - i); k++) { const z = obj[String(i + k + 1)]; if (okZh(z)) out[i + k] = toSimp(String(z).trim()); }
-    } catch (e) { dbg("AI 翻译失败：" + e.message); }
+      const obj = parseJsonObj(await aiChat(`你是专业的意大利语→中文字幕译者。\n场景：${summary || "（未知）"}\n本片词义表（必须遵守）：${glossTxt || "（无）"}\n请结合整段语境，把第 ${want} 行译成自然、口语化的简体中文字幕：保留语气词（eh→唉/呃，beh→嗯/好吧，dai→快点/得了），多义词按语境选义，不要逐词直译，识别错误按语境合理理解。只输出 JSON 对象，键为行号字符串，值为译文。\n转写：\n${ctx}`));
+      for (let k = i; k < Math.min(texts.length, i + B); k++) { const z = obj[String(k + 1)]; if (okZh(z)) out[k] = toSimp(String(z).trim()); }
+    } catch (e) { dbg("AI 第2步（翻译）失败：" + e.message); }
   }
+  // Pass 3: self-check, corrections only
+  if (out.some(Boolean)) {
+    try {
+      const pairs = texts.map((t, k) => `${k + 1}. ${t}\n   → ${out[k] || "（空）"}`).join("\n");
+      const fix = parseJsonObj(await aiChat(`请审校下面的意大利语→中文字幕。场景：${summary}\n词义表：${glossTxt}\n只找出误译、漏译、语气不自然或与语境不符的行，给出修正后的译文。只输出 JSON，键为行号，值为修正译文；没有问题就输出 {}。\n${big ? pairs.slice(0, 9000) : pairs}`));
+      let n = 0;
+      for (const [k, v] of Object.entries(fix)) { const idx = Number(k) - 1; if (idx >= 0 && idx < out.length && okZh(v)) { out[idx] = toSimp(String(v).trim()); n++; } }
+      dbg(`AI 第3步（审校）修正 ${n} 行`);
+    } catch (e) { dbg("AI 第3步（审校）失败，保留第2步结果：" + e.message); }
+  }
+  lastAiContext = { summary, glossary };
   return out;
 }
 async function aiExplain(text, around) {
@@ -549,9 +577,10 @@ function showVocab() {
 
 /* Batches of ~8 neighbouring sentences go to Google in one request (context + fewer calls);
    anything empty/English is retried per line, then via MyMemory. Output forced to Simplified. */
-async function translateSentences(texts, onEach) {
+async function translateSentences(texts, onEach, title) {
   if (onEach) onEach(0, texts.length);
-  const out = await aiTranslateAll(texts).catch(() => new Array(texts.length).fill(""));
+  try { setWork("AI 正在理解语境并翻译…", "三步：概括场景 → 全文翻译 → 自我审校（约 20–90 秒）", null); } catch (e) {}
+  const out = await aiTranslateAll(texts, title).catch(() => new Array(texts.length).fill(""));
   const ai = out.filter(Boolean).length;
   dbg(`AI 翻译 ${ai}/${texts.length}`);
   let google = 0, mm = 0;
@@ -574,7 +603,7 @@ async function translateSentences(texts, onEach) {
   }
   const ok = out.filter(Boolean).length;
   const method = ok ? `AI(Pollinations) ${ai} + Google ${google} + MyMemory ${mm}（已转简体）` : "none (translation failed)";
-  return { zh: out, method, ok };
+  return { zh: out, method, ok, summary: lastAiContext.summary, glossary: lastAiContext.glossary };
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -720,12 +749,12 @@ async function runJob(job) {
   setWork("正在翻译成中文…", `0 / ${sentences.length}`, 80);
   let tr = { zh: sentences.map(() => ""), method: "none", ok: 0 };
   try {
-    tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 80 + (i / n) * 17));
+    tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 80 + (i / n) * 17), job.title);
   } catch (e) { dbg("翻译失败：" + e.message); }
   dbg(`翻译 ${tr.ok}/${sentences.length}`);
   const lesson = {
     id: "L" + Date.now().toString(36), title: job.title, createdAt: job.createdAt, duration: job.duration,
-    model: modelId, device: ready.device, dtype: ready.dtype, translationMethod: tr.method, transcribeMs,
+    model: modelId, device: ready.device, dtype: ready.dtype, translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], transcribeMs,
     audioMime: job.audioMime, audio: job.audio, video: job.video || null,
     sentences: sentences.map((s, i) => ({ i, start: Math.round(s.start * 1000) / 1000, end: Math.round(s.end * 1000) / 1000, it: s.text, zh: tr.zh[i] || "" })),
   };
@@ -765,10 +794,10 @@ async function processWithSrt(media, srtText) {
   const audio = encodeMp3(pcm) || encodeWav(pcm); pcm = null;
   const sentences = toSentenceSegments(segs);
   let tr = { zh: sentences.map(() => ""), method: "none", ok: 0 };
-  try { tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 30 + (i / n) * 65)); } catch (e) {}
+  try { tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 30 + (i / n) * 65), media.name); } catch (e) {}
   const lesson = {
     id: "L" + Date.now().toString(36), title: media.name.replace(/\.[^.]+$/, ""), createdAt: Date.now(), duration,
-    model: "srt", device: "-", dtype: "-", translationMethod: tr.method, audioMime: audio.type, audio,
+    model: "srt", device: "-", dtype: "-", translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], audioMime: audio.type, audio,
     sentences: sentences.map((s, i) => ({ i, start: s.start, end: s.end, it: s.text, zh: tr.zh[i] || "" })),
   };
   await putLesson(lesson);
@@ -813,6 +842,10 @@ async function openLesson(id, preloaded) {
     fmtDur(lesson.duration),
     "意大利语 → 简体中文",
   ].filter(Boolean).join(" · ");
+  const sb = $("sceneBox");
+  const gl = (lesson.glossary || []).map((g) => `${esc(g.it)}＝${esc(g.zh)}`).join("　");
+  sb.innerHTML = lesson.summary ? `<b>场景：</b>${esc(lesson.summary)}${gl ? `<div class="muted" style="margin-top:4px">词义：${gl}</div>` : ""}` : "";
+  sb.hidden = !lesson.summary;
   showView("player");
   if (playerCtl && playerCtl.destroy) playerCtl.destroy();
   playerCtl = attachPlayer(lesson, currentAudioUrl);
