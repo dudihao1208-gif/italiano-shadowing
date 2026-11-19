@@ -416,18 +416,153 @@ async function translateOne(text) {
   try { const z = await myMemory(text); if (okZh(z)) return toSimp(z); } catch (e) {}
   return "";
 }
+/* ---- free no-key LLM (Pollinations, OpenAI-compatible, CORS *) ---- */
+const AI_URL = "https://text.pollinations.ai/openai";
+let aiQueue = Promise.resolve();
+function aiChat(prompt, timeoutMs) {
+  const run = aiQueue.then(async () => {
+    for (let k = 0; k < 4; k++) {
+      try { return await aiChatOnce(prompt, timeoutMs); }
+      catch (e) { if (!/40[29]|429|5\d\d/.test(e.message) || k === 3) throw e; dbg("AI 限流，稍后重试：" + e.message); await sleep(4000 * (k + 1)); }
+    }
+  });
+  aiQueue = run.catch(() => {});
+  return run;
+}
+async function aiChatOnce(prompt, timeoutMs = 90000) {
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(AI_URL, { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
+      body: JSON.stringify({ model: "openai", messages: [{ role: "user", content: prompt }] }) });
+    if (!r.ok) throw new Error("AI HTTP " + r.status);
+    const d = await r.json();
+    return (((d.choices || [])[0] || {}).message || {}).content || "";
+  } finally { clearTimeout(tm); }
+}
+function parseJsonObj(s) { const i = s.indexOf("{"), j = s.lastIndexOf("}"); if (i < 0 || j < i) throw new Error("AI 没返回 JSON"); return JSON.parse(s.slice(i, j + 1)); }
+async function aiTranslateAll(texts) {
+  const out = new Array(texts.length).fill("");
+  const B = 40;
+  for (let i = 0; i < texts.length; i += B) {
+    const ctx = texts.slice(Math.max(0, i - 3), i).map((t) => "（上文）" + t).join("\n");
+    const lines = texts.slice(i, i + B).map((t, k) => `${i + k + 1}. ${t}`).join("\n");
+    const prompt = `你是意大利语-中文字幕译者。下面是一段意大利语口语转写（可能有识别错误），请结合全文语境，把每个编号行译成自然、口语化的简体中文（不要逐词直译，注意多义词按语境，例如 campagne 在“qua ci sono solo campagne”里是田野/乡下）。只输出 JSON 对象，键是行号字符串，值是译文，不要任何解释。\n${ctx ? ctx + "\n" : ""}${lines}`;
+    try {
+      const obj = parseJsonObj(await aiChat(prompt));
+      for (let k = 0; k < Math.min(B, texts.length - i); k++) { const z = obj[String(i + k + 1)]; if (okZh(z)) out[i + k] = toSimp(String(z).trim()); }
+    } catch (e) { dbg("AI 翻译失败：" + e.message); }
+  }
+  return out;
+}
+async function aiExplain(text, around) {
+  return aiChat(`请用简体中文为中文母语的意大利语初学者解释这句意大利语。上下文：${around}\n句子：${text}\n按以下格式简洁回答：\n【意思】自然的中文意思\n【重点词】每个关键词：原形 + 词性 + 在本句的意思\n【语法】1–3 个要点`);
+}
+async function googleOne(text, sl, tl) {
+  const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=` + encodeURIComponent(text));
+  if (!r.ok) throw new Error("Google " + r.status);
+  return ((await r.json())[0] || []).map((x) => x[0] || "").join("").trim();
+}
+async function myMemoryPair(text, pair) {
+  const d = await (await fetch("https://api.mymemory.translated.net/get?" + new URLSearchParams({ q: text, langpair: pair }))).json();
+  const z = ((d.responseData || {}).translatedText || "").trim(); return z.includes("MYMEMORY WARNING") ? "" : z;
+}
+async function lingva(text) {
+  for (const h of ["lingva.ml", "lingva.lunar.icu", "translate.plausibility.cloud"]) {
+    try { const r = await fetch(`https://${h}/api/v1/it/zh/` + encodeURIComponent(text)); if (r.ok) { const z = (await r.json()).translation; if (z) return z; } } catch (e) {}
+  }
+  throw new Error("Lingva 实例都不可用");
+}
+async function alternatives(text, around) {
+  const engines = [
+    ["AI（结合上下文）", async () => { const o = parseJsonObj(await aiChat(`结合上下文把意大利语句子译成自然口语化简体中文，给出 2 种不同译法。只输出 JSON {"1":"...","2":"..."}。上下文：${around}\n句子：${text}`)); return [o["1"], o["2"]].filter(Boolean).join(" ／ "); }],
+    ["Google（意→中）", () => googleOne(text, "it", "zh-CN")],
+    ["Google（意→英→中）", async () => googleOne(await googleOne(text, "it", "en"), "en", "zh-CN")],
+    ["MyMemory（意→中）", () => myMemoryPair(text, "it|zh-CN")],
+    ["MyMemory（意→英→中）", async () => myMemoryPair(await myMemoryPair(text, "it|en"), "en|zh-CN")],
+    ["Lingva", () => lingva(text)],
+  ];
+  return Promise.all(engines.map(async ([name, fn]) => { try { const z = await fn(); return { name, zh: okZh(z) ? toSimp(z) : "", err: okZh(z) ? "" : "无结果" }; } catch (e) { return { name, zh: "", err: e.message }; } }));
+}
+
+/* ---- word lookup: en.wiktionary (Italian section, follows "plural of"/form-of to lemma) → zh ---- */
+const stripHtml = (s) => String(s || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+async function wiktIt(word) {
+  const r = await fetch("https://en.wiktionary.org/api/rest_v1/page/definition/" + encodeURIComponent(word));
+  if (!r.ok) return null;
+  const d = await r.json();
+  return d.it || null;
+}
+async function lookupWord(raw) {
+  const w = raw.toLowerCase().replace(/^[^a-zàèéìíòóù]*(?:[a-z]+['’])?/i, (m) => (/['’]$/.test(m) ? "" : m)).replace(/[^a-zàèéìíòóù]/gi, "");
+  let lemma = w, entries = await wiktIt(w);
+  if (entries) {
+    const html = JSON.stringify(entries);
+    const m = html.match(/form-of-definition-link[^]*?<a[^>]*title=\\"([^"\\]+)\\"/);
+    const senses = entries.flatMap((e) => e.definitions.map((x) => stripHtml(x.definition))).filter(Boolean);
+    if (m && senses.every((s) => /\b(of|form)\b/.test(s) && s.length < 60)) { lemma = m[1]; entries = (await wiktIt(lemma)) || entries; }
+  }
+  const senses = [];
+  (entries || []).forEach((e) => e.definitions.forEach((x) => { const t = stripHtml(x.definition); if (t) senses.push({ pos: e.partOfSpeech, en: t }); }));
+  const top = senses.slice(0, 5);
+  const zhs = await Promise.all(top.map((s) => myMemoryPair(s.en.split(/[;(]/)[0].slice(0, 120), "en|zh-CN").then(toSimp).catch(() => "")));
+  top.forEach((s, i) => (s.zh = okZh(zhs[i]) ? zhs[i] : ""));
+  let google = "";
+  try {
+    const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&sl=it&tl=zh-CN&dt=t&dt=bd&q=" + encodeURIComponent(lemma));
+    if (r.ok) { const d = await r.json(); google = (d[1] || []).map((p) => p[0] + "：" + (p[1] || []).slice(0, 6).join("、")).join("；") || ((d[0] || [])[0] || [])[0] || ""; }
+  } catch (e) {}
+  return { word: w, lemma, senses: top, google: toSimp(google) };
+}
+const VOCAB_KEY = "miraa-vocab";
+const getVocab = () => { try { return JSON.parse(localStorage.getItem(VOCAB_KEY) || "[]"); } catch (e) { return []; } };
+const setVocab = (v) => { try { localStorage.setItem(VOCAB_KEY, JSON.stringify(v)); } catch (e) {} };
+
+function modal(html) {
+  let m = $("modal");
+  if (!m) {
+    m = document.createElement("div"); m.id = "modal";
+    m.innerHTML = '<div class="mbg"></div><div class="mbox"><button type="button" class="mclose">关闭</button><div class="mbody"></div></div>';
+    document.body.appendChild(m);
+    m.querySelector(".mbg").onclick = m.querySelector(".mclose").onclick = () => (m.hidden = true);
+  }
+  m.querySelector(".mbody").innerHTML = html; m.hidden = false; return m.querySelector(".mbody");
+}
+const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+async function showWord(word, sentence, lessonId) {
+  const body = modal(`<h3>${esc(word)}</h3><p class="muted">查询中…</p>`);
+  const r = await lookupWord(word);
+  body.innerHTML = `<h3>${esc(r.word)}${r.lemma !== r.word ? ` <span class="muted">← 原形 ${esc(r.lemma)}</span>` : ""}</h3>
+    ${r.google ? `<p><b>词典：</b>${esc(r.google)}</p>` : ""}
+    ${r.senses.length ? "<ol>" + r.senses.map((s) => `<li>${s.zh ? `<b>${esc(s.zh)}</b> · ` : ""}<span class="muted">${esc(s.pos)} · ${esc(s.en)}</span></li>`).join("") + "</ol>" : '<p class="muted">词典里没查到。</p>'}
+    <p class="muted">例句：${esc(sentence)}</p><button type="button" class="primary" id="addVocab">加入生词本</button>`;
+  body.querySelector("#addVocab").onclick = () => {
+    const v = getVocab().filter((x) => x.lemma !== r.lemma);
+    v.unshift({ word: r.word, lemma: r.lemma, zh: r.senses.map((s) => s.zh).filter(Boolean).slice(0, 3).join("；") || r.google, sentence, lessonId, t: Date.now() });
+    setVocab(v); body.querySelector("#addVocab").textContent = "已加入 ✓";
+  };
+}
+function showVocab() {
+  const v = getVocab();
+  const body = modal(`<h3>生词本（${v.length}）</h3>` + (v.length ? v.map((x, i) => `<div class="vrow"><b>${esc(x.lemma)}</b>${x.word !== x.lemma ? ` (${esc(x.word)})` : ""} — ${esc(x.zh)}<div class="muted">${esc(x.sentence)}</div><button type="button" data-i="${i}">删除</button></div>`).join("") : '<p class="muted">还没有生词。在课程里点意大利语单词即可查询并加入。</p>'));
+  body.querySelectorAll("button[data-i]").forEach((b) => (b.onclick = () => { const a2 = getVocab(); a2.splice(Number(b.dataset.i), 1); setVocab(a2); showVocab(); }));
+}
+
 /* Batches of ~8 neighbouring sentences go to Google in one request (context + fewer calls);
    anything empty/English is retried per line, then via MyMemory. Output forced to Simplified. */
 async function translateSentences(texts, onEach) {
-  const out = new Array(texts.length).fill("");
+  if (onEach) onEach(0, texts.length);
+  const out = await aiTranslateAll(texts).catch(() => new Array(texts.length).fill(""));
+  const ai = out.filter(Boolean).length;
+  dbg(`AI 翻译 ${ai}/${texts.length}`);
   let google = 0, mm = 0;
   const B = 8;
   for (let i = 0; i < texts.length; i += B) {
+    if (texts.slice(i, i + B).every((_, k) => out[i + k])) continue;
     if (cancelled) throw new Error("已取消");
     const batch = texts.slice(i, i + B);
     try {
       const res = await googleBatch(batch);
-      res.forEach((z, k) => { if (okZh(z)) { out[i + k] = toSimp(z); google++; } });
+      res.forEach((z, k) => { if (!out[i + k] && okZh(z)) { out[i + k] = toSimp(z); google++; } });
     } catch (e) { dbg("Google 批量翻译失败：" + e.message); }
     for (let k = 0; k < batch.length; k++) {
       if (out[i + k]) continue;
@@ -438,7 +573,7 @@ async function translateSentences(texts, onEach) {
     await sleep(300);
   }
   const ok = out.filter(Boolean).length;
-  const method = ok ? `Google ${google} + MyMemory ${mm}（已转简体）` : "none (translation failed)";
+  const method = ok ? `AI(Pollinations) ${ai} + Google ${google} + MyMemory ${mm}（已转简体）` : "none (translation failed)";
   return { zh: out, method, ok };
 }
 
@@ -764,11 +899,33 @@ function attachPlayer(lesson, audioSrc) {
         '<div class="s-top"><span class="idx"></span><button type="button" class="star" aria-label="收藏"></button></div>' +
         '<div class="it"></div><div class="zh"></div>' +
         '<div class="hide-note">译文已隐藏，点「显示译文」查看</div>' +
-        '<div class="rec-row"><button type="button" class="edit">编辑原文</button><button type="button" class="play-mine">播放我的录音</button>' +
+        '<div class="rec-row"><button type="button" class="explain">解释这句</button><button type="button" class="alt">换个翻译</button><button type="button" class="editzh">改中文</button><button type="button" class="edit">编辑原文</button><button type="button" class="play-mine">播放我的录音</button>' +
         '<button type="button" class="cmp">对比：先原音再我的</button></div>';
       el.querySelector(".idx").textContent = (i + 1) + " / " + sentences.length + " · " + fmt(s.start);
       el.querySelector(".star").textContent = isFav(i) ? "★" : "☆";
-      el.querySelector(".it").textContent = s.it || "";
+      const itEl = el.querySelector(".it");
+      (s.it || "").split(/(\s+)/).forEach((tok) => {
+        if (/^\s+$/.test(tok) || !tok) { itEl.appendChild(document.createTextNode(tok)); return; }
+        const sp = document.createElement("span"); sp.className = "w"; sp.textContent = tok;
+        sp.addEventListener("click", (e) => { if (i !== idx) return; e.stopPropagation(); showWord(tok, s.it, lesson.id); });
+        itEl.appendChild(sp);
+      });
+      const around = () => sentences.slice(Math.max(0, i - 2), i + 3).map((x) => x.it).join(" ");
+      el.querySelector(".explain").addEventListener("click", async (e) => {
+        e.stopPropagation(); const body = modal(`<h3>解释</h3><p>${esc(s.it)}</p><p class="muted">AI 思考中…（约 5–20 秒）</p>`);
+        try { body.innerHTML = `<h3>解释</h3><p><b>${esc(s.it)}</b></p><div style="white-space:pre-wrap">${esc(await aiExplain(s.it, around()))}</div>`; }
+        catch (er) { body.innerHTML = `<p>AI 暂时不可用：${esc(er.message)}</p>`; }
+      });
+      el.querySelector(".alt").addEventListener("click", async (e) => {
+        e.stopPropagation(); const body = modal(`<h3>换个翻译</h3><p>${esc(s.it)}</p><p class="muted">正在向多个引擎查询…</p>`);
+        const alts = await alternatives(s.it, around());
+        body.innerHTML = `<h3>换个翻译</h3><p><b>${esc(s.it)}</b></p><p class="muted">当前：${esc(s.zh)}</p>` + alts.map((x, k) => `<div class="vrow"><div class="muted">${esc(x.name)}</div>${x.zh ? `${esc(x.zh)} <button type="button" data-k="${k}">用这个</button>` : `<span class="muted">（${esc(x.err)}）</span>`}</div>`).join("");
+        body.querySelectorAll("button[data-k]").forEach((b) => (b.onclick = async () => { s.zh = alts[Number(b.dataset.k)].zh; try { await putLesson(lesson); } catch (er) {} $("modal").hidden = true; renderList(); }));
+      });
+      el.querySelector(".editzh").addEventListener("click", async (e) => {
+        e.stopPropagation(); const nz = prompt("修改中文译文：", s.zh || ""); if (nz == null) return;
+        s.zh = nz.trim(); try { await putLesson(lesson); } catch (er) {} renderList();
+      });
       el.querySelector(".zh").textContent = s.zh || "";
       if (!recUrls[i]) {
         el.querySelector(".play-mine").disabled = true;
@@ -1226,6 +1383,7 @@ function boot() {
   $("btnSrt").addEventListener("click", () => { alert("第 1 步：选择音视频文件；第 2 步：选择对应的意大利语 .srt 字幕"); $("srtMedia").click(); });
   $("srtMedia").addEventListener("change", () => { srtMediaFile = $("srtMedia").files[0]; $("srtMedia").value = ""; if (srtMediaFile) $("srtFile").click(); });
   $("srtFile").addEventListener("change", async () => { const f = $("srtFile").files[0]; $("srtFile").value = ""; if (f && srtMediaFile) processWithSrt(srtMediaFile, await f.text()); });
+  $("btnVocab").addEventListener("click", showVocab);
   $("btnPick").addEventListener("click", () => filePick.click());
   filePick.addEventListener("change", () => {
     const f = filePick.files && filePick.files[0];
