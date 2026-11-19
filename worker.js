@@ -69,9 +69,9 @@ async function loadModel(modelId, preferGpu) {
   const attempts = [];
   if (preferGpu && (await canWebGPU())) {
     attempts.push({ device: "webgpu", dtype: "q8" });
-    attempts.push({ device: "webgpu", dtype: "q4" });
   }
-  attempts.push({ device: "wasm", dtype: "q8" });
+  // q8 is the smallest download and lowest memory for whisper (q4 files are larger for tiny/base).
+  attempts.push({ device: "wasm", dtype: { encoder_model: "q8", decoder_model_merged: "q8" } });
 
   let lastErr;
   for (const opt of attempts) {
@@ -80,14 +80,14 @@ async function loadModel(modelId, preferGpu) {
         type: "progress",
         phase: "load",
         status: "starting",
-        file: `${modelId} · ${opt.device}/${opt.dtype}`,
+        file: `${modelId} · ${opt.device}`,
       });
       transcriber = await pipeline("automatic-speech-recognition", modelId, {
         device: opt.device,
         dtype: opt.dtype,
         progress_callback: progressCb("download"),
       });
-      loaded = { modelId, device: opt.device, dtype: opt.dtype };
+      loaded = { modelId, device: opt.device, dtype: typeof opt.dtype === 'string' ? opt.dtype : 'q8' };
       post({ type: "ready", ...loaded });
       return;
     } catch (err) {

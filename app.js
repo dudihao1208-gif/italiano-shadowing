@@ -149,6 +149,8 @@ function resampleLinear(input, fromRate, toRate) {
   return out;
 }
 
+const TINY = "onnx-community/whisper-tiny";
+const LOADING_KEY = "miraa-loading-model";
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
 /* ---------------- persistent debug log ---------------- */
@@ -489,8 +491,8 @@ async function processFile(file) {
     audio: audioBlob, audioMime: audioBlob.type, model: modelSel.value, segments: [], doneSec: 0,
   };
   await saveJob(job);
-  dbg("已保存可续做的进度");
-  await runJob(job, pcm);
+  dbg("已保存可续做的进度（释放音频内存后再加载模型）");
+  await runJob(job);
 }
 let decodedTitle = "";
 
@@ -499,31 +501,39 @@ async function resumeJob() {
   if (!job) return;
   showView("work");
   dbg(`继续上次：已完成 ${Math.round(job.doneSec)}s / ${Math.round(job.duration)}s`);
-  let pcm;
-  try {
-    pcm = (await decodeTo16kMono(new File([job.audio], "job.mp3", { type: job.audioMime }))).pcm;
-  } catch (e) { setWork("无法继续", String(e.message || e), 0); return; }
-  await runJob(job, pcm);
+  await runJob(job);
 }
 
-async function runJob(job, pcm) {
-  const modelId = job.model || "onnx-community/whisper-tiny";
+async function runJob(job) {
+  let modelId = job.model || TINY;
+  if (IS_IOS && modelId !== TINY) { dbg("iPhone 内存有限，改用 whisper-tiny"); modelId = TINY; }
+  if (localStorage.getItem(LOADING_KEY) && modelId !== TINY) { dbg("上次加载模型时页面崩溃，自动改用 whisper-tiny"); modelId = TINY; }
+  job.model = modelId; await saveJob(job);
+  try { localStorage.setItem(LOADING_KEY, modelId); } catch (e) {}
   const meta = MODELS[modelId] || { label: modelId, downloadMB: "?" };
   setWork("正在加载语音识别模型…", `首次需要下载约 ${meta.downloadMB} MB`, 20);
   dbg("加载模型 " + modelId);
+  const lastPct = {};
   let ready;
   try {
     ready = await loadModel(modelId, (msg) => {
+      if (msg.phase === "download" && msg.status === "done" && msg.file) dbg("模型文件就绪：" + msg.file);
+      if (msg.phase === "download" && msg.total && msg.pct != null && msg.pct % 25 === 0 && lastPct[msg.file] !== msg.pct) { lastPct[msg.file] = msg.pct; dbg(`下载 ${msg.file} ${msg.pct}%`); }
       if (msg.phase === "download" && msg.total) {
         setWork("正在加载语音识别模型…", `下载 ${(msg.file || "").split("/").pop()} ${fmtBytes(msg.loaded)} / ${fmtBytes(msg.total)}`, 20 + (msg.pct || 0) * 0.2);
       }
     });
     dbg(`模型就绪 ${ready.device}/${ready.dtype}`);
+    try { localStorage.removeItem(LOADING_KEY); } catch (e) {}
   } catch (e) {
     dbg("模型加载失败：" + e.message);
     setWork("模型加载失败", e.message, 0);
     return;
   }
+  let pcm;
+  try {
+    pcm = (await decodeTo16kMono(new File([job.audio], "job.mp3", { type: job.audioMime || "audio/mpeg" }))).pcm;
+  } catch (e) { dbg("重新解码失败：" + e.message); setWork("无法读取音频", String(e.message || e), 0); return; }
   const CH = 30 * RATE;
   const total = pcm.length;
   const t0 = performance.now();
@@ -1073,6 +1083,16 @@ const LESSON = __LESSON_JSON__;
 /* ---------------- boot ---------------- */
 function boot() {
   if (!isSecure()) $("secureNote").hidden = false;
+  dbg("设备：" + navigator.userAgent.slice(0, 120) + " · deviceMemory=" + (navigator.deviceMemory || "?") + "GB · cores=" + (navigator.hardwareConcurrency || "?"));
+  if (localStorage.getItem(LOADING_KEY)) {
+    dbg("检测到上次加载模型 " + localStorage.getItem(LOADING_KEY) + " 时页面被重新加载（多半内存不足），已切换为 whisper-tiny");
+    try { localStorage.setItem("miraa-phone-model", TINY); } catch (e) {}
+  }
+  if (IS_IOS) {
+    try { localStorage.setItem("miraa-phone-model", TINY); } catch (e) {}
+    const opt = modelSel.querySelector('option[value="onnx-community/whisper-base"]');
+    if (opt) { opt.disabled = true; opt.textContent += "（iPhone 内存不足，已禁用）"; }
+  }
   try {
     const saved = localStorage.getItem("miraa-phone-model");
     if (saved && MODELS[saved]) modelSel.value = saved;
