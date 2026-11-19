@@ -1,12 +1,52 @@
-/* 意大利语跟读 — phone-only app (library, in-browser Whisper, player, export). */
-const MODELS = {
+/* 外语跟读 — phone-only app (library, in-browser Whisper, player, export). */
+const MODEL_CATALOG = {
   "onnx-community/whisper-tiny": { label: "whisper-tiny", downloadMB: 43 },
   "onnx-community/whisper-base": { label: "whisper-base", downloadMB: 77 },
   "onnx-community/whisper-small": { label: "whisper-small", downloadMB: 242 },
+  "onnx-community/whisper-tiny.en": { label: "whisper-tiny.en", downloadMB: 43, enOnly: true },
+  "onnx-community/whisper-base.en": { label: "whisper-base.en", downloadMB: 77, enOnly: true },
 };
+const MULTI_TINY = "onnx-community/whisper-tiny";
+const MULTI_BASE = "onnx-community/whisper-base";
+const MULTI_SMALL = "onnx-community/whisper-small";
+const EN_TINY = "onnx-community/whisper-tiny.en";
+const EN_BASE = "onnx-community/whisper-base.en";
+const MULTI_FALLBACK = { [MULTI_SMALL]: MULTI_BASE, [MULTI_BASE]: MULTI_TINY };
+const LANGS = {
+  it: {
+    id: "it", name: "意大利语", whisper: "italian", sl: "it", wikt: "it",
+    tiny: MULTI_TINY, models: [MULTI_TINY, MULTI_BASE, MULTI_SMALL], fallback: MULTI_FALLBACK,
+    fillers: "eh→唉/呃，beh→嗯/好吧，dai→快点/得了",
+  },
+  en: {
+    id: "en", name: "英语", whisper: "english", sl: "en", wikt: "en",
+    tiny: EN_TINY, models: [EN_TINY, EN_BASE, MULTI_TINY, MULTI_BASE, MULTI_SMALL],
+    fallback: { [MULTI_SMALL]: EN_BASE, [MULTI_BASE]: EN_TINY, [EN_BASE]: EN_TINY, [EN_TINY]: MULTI_TINY },
+    fillers: "uh/um→呃，oh→哦，well→嗯/好吧，like→就是",
+  },
+  ja: {
+    id: "ja", name: "日语", whisper: "japanese", sl: "ja", wikt: "ja",
+    tiny: MULTI_TINY, models: [MULTI_TINY, MULTI_BASE, MULTI_SMALL], fallback: MULTI_FALLBACK,
+    fillers: "あの→那个，えっと→呃，まあ→嗯",
+  },
+};
+const LANG_IDS = ["it", "en", "ja"];
+let curLang = "it";
+const langCfg = () => LANGS[curLang] || LANGS.it;
+const srcName = () => langCfg().name;
+const srcCode = () => langCfg().sl;
+const MODELS = MODEL_CATALOG;
+function fallbackOf(m) {
+  const L = langCfg();
+  return (L.fallback && L.fallback[m]) || L.tiny || MULTI_TINY;
+}
+function lsKey(suffix, lang = curLang) { return "miraa-" + lang + "-" + suffix; }
 const RATE = 16000;
 const CJK_RE = /[\u4e00-\u9fff]/;
-const SENT_END_RE = /([.!?…]+)(?:\s+|$)/;
+function sentEndRe(lang = curLang) {
+  return lang === "ja" ? /([。！？!?…]+)/ : /([.!?…]+)(?:\s+|$)/;
+}
+const SENT_END_RE = sentEndRe("it");
 
 const $ = (id) => document.getElementById(id);
 const filePick = $("filePick");
@@ -30,35 +70,35 @@ function isSecure() {
 }
 
 /* ---------------- IndexedDB ---------------- */
-const DB_NAME = "miraa-phone";
 const DB_VER = 1;
-
-function openDb() {
+const dbCache = {};
+function dbNameFor(lang = curLang) { return "miraa-phone-" + lang; }
+function openDbNamed(name) {
+  if (dbCache[name]) return Promise.resolve(dbCache[name]);
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VER);
+    const req = indexedDB.open(name, DB_VER);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if (!db.objectStoreNames.contains("lessons")) {
-        db.createObjectStore("lessons", { keyPath: "id" });
-      }
-      if (!db.objectStoreNames.contains("recordings")) {
-        db.createObjectStore("recordings");
-      }
+      if (!db.objectStoreNames.contains("lessons")) db.createObjectStore("lessons", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("recordings")) db.createObjectStore("recordings");
     };
+    req.onsuccess = () => { dbCache[name] = req.result; resolve(req.result); };
+    req.onerror = () => reject(req.error);
+  });
+}
+const openDb = (lang = curLang) => openDbNamed(dbNameFor(lang));
+
+async function idbOpOn(db, store, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const req = fn(tx.objectStore(store));
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
-
 async function idbOp(store, mode, fn) {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, mode);
-    const st = tx.objectStore(store);
-    const req = fn(st);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+  return idbOpOn(db, store, mode, fn);
 }
 
 const listLessons = () => idbOp("lessons", "readonly", (s) => s.getAll());
@@ -67,6 +107,58 @@ const putLesson = (lesson) => idbOp("lessons", "readwrite", (s) => s.put(lesson)
 const delLesson = (id) => idbOp("lessons", "readwrite", (s) => s.delete(id));
 const putRec = (key, blob) => idbOp("recordings", "readwrite", (s) => s.put(blob, key));
 const getRec = (key) => idbOp("recordings", "readonly", (s) => s.get(key));
+
+async function copyStore(src, dest, store, keyed) {
+  if (!src.objectStoreNames.contains(store) || !dest.objectStoreNames.contains(store)) return 0;
+  const items = await idbOpOn(src, store, "readonly", (s) => s.getAll()) || [];
+  const keys = keyed ? (await idbOpOn(src, store, "readonly", (s) => s.getAllKeys()) || []) : null;
+  for (let i = 0; i < items.length; i++) {
+    await idbOpOn(dest, store, "readwrite", (s) => keyed ? s.put(items[i], keys[i]) : s.put(items[i]));
+  }
+  return items.length;
+}
+async function migrateItalianIfNeeded() {
+  const flag = "miraa-it-migrated-v1";
+  try { if (localStorage.getItem(flag)) return; } catch (e) {}
+  try {
+    let hasLegacy = false;
+    if (indexedDB.databases) {
+      try { hasLegacy = (await indexedDB.databases()).some((d) => d && d.name === "miraa-phone"); } catch (e) {}
+    } else hasLegacy = true;
+    const legacy = hasLegacy ? await new Promise((resolve) => {
+      const r = indexedDB.open("miraa-phone");
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => resolve(null);
+    }) : null;
+    const dest = await openDbNamed("miraa-phone-it");
+    const existing = dest.objectStoreNames.contains("lessons") ? (await idbOpOn(dest, "lessons", "readonly", (s) => s.getAll()) || []) : [];
+    const real = existing.filter((x) => x && x.id !== "__job__");
+    if (legacy && legacy.objectStoreNames.contains("lessons") && real.length === 0) {
+      const nL = await copyStore(legacy, dest, "lessons", false);
+      const nR = await copyStore(legacy, dest, "recordings", true);
+      dbg("已把原来的课迁移到意大利语（" + nL + " 课，" + nR + " 条录音）");
+    }
+    const pairs = [["miraa-vocab", "miraa-it-vocab"], ["miraa-phone-model", "miraa-it-model"], ["miraa-loading-model", "miraa-it-loading-model"], ["miraa-submode", "miraa-it-submode"]];
+    for (const [o, n] of pairs) {
+      try { if (localStorage.getItem(n) == null && localStorage.getItem(o) != null) localStorage.setItem(n, localStorage.getItem(o)); } catch (e) {}
+    }
+    try {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+      for (const k of keys) {
+        if (!k) continue;
+        if (k.startsWith("miraa-confirmed-")) {
+          const n = "miraa-it-confirmed-" + k.slice("miraa-confirmed-".length);
+          if (localStorage.getItem(n) == null) localStorage.setItem(n, localStorage.getItem(k));
+        } else if (k.startsWith("miraa:") && !k.startsWith("miraa-it:") && !k.startsWith("miraa-en:") && !k.startsWith("miraa-ja:")) {
+          const n = "miraa-it:" + k.slice("miraa:".length);
+          if (localStorage.getItem(n) == null) localStorage.setItem(n, localStorage.getItem(k));
+        }
+      }
+    } catch (e) {}
+  } catch (e) { try { dbg("迁移旧数据时出错：" + ((e && e.message) || e)); } catch (e2) {} }
+  try { localStorage.setItem(flag, "1"); } catch (e) {}
+}
 
 /* ---------------- library ---------------- */
 async function refreshLibrary() {
@@ -151,12 +243,11 @@ function resampleLinear(input, fromRate, toRate) {
   return out;
 }
 
-const TINY = "onnx-community/whisper-tiny";
-const LOADING_KEY = "miraa-loading-model";
-const BASE = "onnx-community/whisper-base", SMALL = "onnx-community/whisper-small";
-const FALLBACK = { [SMALL]: BASE, [BASE]: TINY };
-const fallbackOf = (m) => FALLBACK[m] || TINY;
+const TINY = MULTI_TINY, BASE = MULTI_BASE, SMALL = MULTI_SMALL;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+function loadingKey() { return lsKey("loading-model"); }
+function modelKey() { return lsKey("model"); }
+function confirmKey(m) { return lsKey("confirmed-" + m); }
 
 /* ---------------- persistent debug log ---------------- */
 const DBG_KEY = "miraa-debug";
@@ -321,12 +412,27 @@ async function playbackBlob(file, pcm) {
 }
 
 /* ---------------- sentences ---------------- */
-function splitSentencesInText(text) {
-  text = String(text || "").replace(/\s+/g, " ").trim();
+function tokenizeText(text, lang = curLang) {
+  text = String(text || "");
+  if (lang === "ja" && typeof Intl !== "undefined" && Intl.Segmenter) {
+    try {
+      return [...new Intl.Segmenter("ja", { granularity: "word" }).segment(text)].map((s) => ({ t: s.segment, word: !!s.isWordLike }));
+    } catch (e) {}
+  }
+  return text.split(/(\s+)/).map((tok) => ({ t: tok, word: !!tok && !/^\s+$/.test(tok) }));
+}
+function isSentenceEnd(text, lang = curLang) {
+  const t = String(text || "").trim();
+  if (!sentEndRe(lang).test(t)) return false;
+  if (lang === "ja") return t.replace(/[。！？!?…\s]/g, "").length >= 2;
+  return t.split(/\s+/).length >= 2;
+}
+function splitSentencesInText(text, lang = curLang) {
+  text = String(text || "").replace(/\s+/g, lang === "ja" ? "" : " ").trim();
   if (!text) return [];
   const parts = [];
   let last = 0;
-  const re = new RegExp(SENT_END_RE.source, "g");
+  const re = new RegExp(sentEndRe(lang).source, "g");
   let m;
   while ((m = re.exec(text))) {
     const chunk = text.slice(last, m.index + m[1].length).trim();
@@ -363,14 +469,14 @@ function toSentenceSegments(segments) {
     merged.push({
       start: buf[0].start,
       end: buf[buf.length - 1].end,
-      text: buf.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim(),
+      text: buf.map((s) => s.text).join(curLang === "ja" ? "" : " ").replace(/\s+/g, curLang === "ja" ? "" : " ").trim(),
     });
     buf = [];
   };
   for (const seg of split) {
     if (!buf.length) {
       buf = [seg];
-      if (SENT_END_RE.test(seg.text.trim()) && seg.text.split(/\s+/).length >= 2) flush();
+      if (isSentenceEnd(seg.text)) flush();
       continue;
     }
     const span = seg.end - buf[0].start;
@@ -380,10 +486,10 @@ function toSentenceSegments(segments) {
       flush();
       buf = [seg];
     } else buf.push(seg);
-    if (buf.length && SENT_END_RE.test(buf[buf.length - 1].text.trim())) flush();
+    if (buf.length && isSentenceEnd(buf[buf.length - 1].text)) flush();
   }
   flush();
-  return merged.filter((s) => s.text && !/^[.!?…]+$/.test(s.text)).map((s) => ({
+  return merged.filter((s) => s.text && !/^[.!?。！？…]+$/.test(s.text)).map((s) => ({
     start: s.start,
     end: s.end > s.start ? s.end : s.start + 0.6,
     text: s.text,
@@ -396,7 +502,7 @@ try { if (window.OpenCC) toSimp = OpenCC.Converter({ from: "tw", to: "cn" }); } 
 const okZh = (z) => !!z && CJK_RE.test(z);
 
 async function googleBatch(lines) {
-  const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=it&tl=zh-CN&dt=t&q=" + encodeURIComponent(lines.join("\n"));
+  const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=" + srcCode() + "&tl=zh-CN&dt=t&q=" + encodeURIComponent(lines.join("\n"));
   const r = await fetch(url);
   if (!r.ok) throw new Error("Google HTTP " + r.status);
   const d = await r.json();
@@ -406,7 +512,7 @@ async function googleBatch(lines) {
   return out;
 }
 async function myMemory(text) {
-  const url = "https://api.mymemory.translated.net/get?" + new URLSearchParams({ q: text, langpair: "it|zh-CN" });
+  const url = "https://api.mymemory.translated.net/get?" + new URLSearchParams({ q: text, langpair: srcCode() + "|zh-CN" });
   const r = await fetch(url);
   if (!r.ok) throw new Error("HTTP " + r.status);
   const d = await r.json();
@@ -456,18 +562,18 @@ async function aiTranslateAll(texts, title) {
   // Pass 1: scene summary + glossary of ambiguous words (cheap; failure is fine)
   let summary = "", glossary = [];
   try {
-    const o = parseJsonObj(await aiChat(`下面是意大利语视频「${title || ""}」的语音转写（可能有识别错误）。请先理解场景。只输出 JSON：{"summary":"用一两句简体中文概括场景、说话人和语气","glossary":[{"it":"意大利语词","zh":"本语境下的中文意思","why":"为什么不是其他意思（简短）"}]}。glossary 只列多义词、俚语、地名人名和关键词，最多 15 个。\n${transcriptForCtx}`));
+    const o = parseJsonObj(await aiChat(`下面是${srcName()}视频「${title || ""}」的语音转写（可能有识别错误）。请先理解场景。只输出 JSON：{"summary":"用一两句简体中文概括场景、说话人和语气","glossary":[{"src":"${srcName()}词","zh":"本语境下的中文意思","why":"为什么不是其他意思（简短）"}]}。glossary 只列多义词、俚语、地名人名和关键词，最多 15 个。\n${transcriptForCtx}`));
     summary = String(o.summary || ""); glossary = Array.isArray(o.glossary) ? o.glossary.slice(0, 15) : [];
     dbg("AI 场景：" + summary.slice(0, 60));
   } catch (e) { dbg("AI 第1步（场景）失败：" + e.message); }
-  const glossTxt = glossary.map((g) => `${g.it} = ${g.zh}`).join("；");
+  const glossTxt = glossary.map((g) => `${g.src || g.it || g.en || g.ja || ""} = ${g.zh}`).join("；");
   // Pass 2: translate with summary + glossary + full transcript (or sliding window)
   const B = big ? 40 : texts.length;
   for (let i = 0; i < texts.length; i += B) {
     const ctx = big ? numbered.slice(Math.max(0, i - 10), Math.min(texts.length, i + B + 10)).join("\n") : whole;
     const want = `${i + 1}–${Math.min(texts.length, i + B)}`;
     try {
-      const obj = parseJsonObj(await aiChat(`你是专业的意大利语→中文字幕译者。\n场景：${summary || "（未知）"}\n本片词义表（必须遵守）：${glossTxt || "（无）"}\n请结合整段语境，把第 ${want} 行译成自然、口语化的简体中文字幕：保留语气词（eh→唉/呃，beh→嗯/好吧，dai→快点/得了），多义词按语境选义，不要逐词直译，识别错误按语境合理理解。只输出 JSON 对象，键为行号字符串，值为译文。\n转写：\n${ctx}`));
+      const obj = parseJsonObj(await aiChat(`你是专业的${srcName()}→中文字幕译者。\n场景：${summary || "（未知）"}\n本片词义表（必须遵守）：${glossTxt || "（无）"}\n请结合整段语境，把第 ${want} 行译成自然、口语化的简体中文字幕：保留语气词（${langCfg().fillers}），多义词按语境选义，不要逐词直译，识别错误按语境合理理解。只输出 JSON 对象，键为行号字符串，值为译文。\n转写：\n${ctx}`));
       for (let k = i; k < Math.min(texts.length, i + B); k++) { const z = obj[String(k + 1)]; if (okZh(z)) out[k] = toSimp(String(z).trim()); }
     } catch (e) { dbg("AI 第2步（翻译）失败：" + e.message); }
   }
@@ -475,7 +581,7 @@ async function aiTranslateAll(texts, title) {
   if (out.some(Boolean)) {
     try {
       const pairs = texts.map((t, k) => `${k + 1}. ${t}\n   → ${out[k] || "（空）"}`).join("\n");
-      const fix = parseJsonObj(await aiChat(`请审校下面的意大利语→中文字幕。场景：${summary}\n词义表：${glossTxt}\n只找出误译、漏译、语气不自然或与语境不符的行，给出修正后的译文。只输出 JSON，键为行号，值为修正译文；没有问题就输出 {}。\n${big ? pairs.slice(0, 9000) : pairs}`));
+      const fix = parseJsonObj(await aiChat(`请审校下面的${srcName()}→中文字幕。场景：${summary}\n词义表：${glossTxt}\n只找出误译、漏译、语气不自然或与语境不符的行，给出修正后的译文。只输出 JSON，键为行号，值为修正译文；没有问题就输出 {}。\n${big ? pairs.slice(0, 9000) : pairs}`));
       let n = 0;
       for (const [k, v] of Object.entries(fix)) { const idx = Number(k) - 1; if (idx >= 0 && idx < out.length && okZh(v)) { out[idx] = toSimp(String(v).trim()); n++; } }
       dbg(`AI 第3步（审校）修正 ${n} 行`);
@@ -485,7 +591,7 @@ async function aiTranslateAll(texts, title) {
   return out;
 }
 async function aiExplain(text, around) {
-  return aiChat(`请用简体中文为中文母语的意大利语初学者解释这句意大利语。上下文：${around}\n句子：${text}\n按以下格式简洁回答：\n【意思】自然的中文意思\n【重点词】每个关键词：原形 + 词性 + 在本句的意思\n【语法】1–3 个要点`);
+  return aiChat(`请用简体中文为中文母语的${srcName()}初学者解释这句${srcName()}。上下文：${around}\n句子：${text}\n按以下格式简洁回答：\n【意思】自然的中文意思\n【重点词】每个关键词：原形 + 词性 + 在本句的意思${curLang === "ja" ? " + 读音（假名）" : ""}\n【语法】1–3 个要点`);
 }
 async function googleOne(text, sl, tl) {
   const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=` + encodeURIComponent(text));
@@ -497,55 +603,126 @@ async function myMemoryPair(text, pair) {
   const z = ((d.responseData || {}).translatedText || "").trim(); return z.includes("MYMEMORY WARNING") ? "" : z;
 }
 async function lingva(text) {
+  const sl = srcCode();
   for (const h of ["lingva.ml", "lingva.lunar.icu", "translate.plausibility.cloud"]) {
-    try { const r = await fetch(`https://${h}/api/v1/it/zh/` + encodeURIComponent(text)); if (r.ok) { const z = (await r.json()).translation; if (z) return z; } } catch (e) {}
+    try { const r = await fetch(`https://${h}/api/v1/${sl}/zh/` + encodeURIComponent(text)); if (r.ok) { const z = (await r.json()).translation; if (z) return z; } } catch (e) {}
   }
   throw new Error("Lingva 实例都不可用");
 }
 async function alternatives(text, around) {
+  const sl = srcCode(), name = srcName();
   const engines = [
-    ["AI（结合上下文）", async () => { const o = parseJsonObj(await aiChat(`结合上下文把意大利语句子译成自然口语化简体中文，给出 2 种不同译法。只输出 JSON {"1":"...","2":"..."}。上下文：${around}\n句子：${text}`)); return [o["1"], o["2"]].filter(Boolean).join(" ／ "); }],
-    ["Google（意→中）", () => googleOne(text, "it", "zh-CN")],
-    ["Google（意→英→中）", async () => googleOne(await googleOne(text, "it", "en"), "en", "zh-CN")],
-    ["MyMemory（意→中）", () => myMemoryPair(text, "it|zh-CN")],
-    ["MyMemory（意→英→中）", async () => myMemoryPair(await myMemoryPair(text, "it|en"), "en|zh-CN")],
-    ["Lingva", () => lingva(text)],
+    ["AI（结合上下文）", async () => { const o = parseJsonObj(await aiChat(`结合上下文把${name}句子译成自然口语化简体中文，给出 2 种不同译法。只输出 JSON {"1":"...","2":"..."}。上下文：${around}\n句子：${text}`)); return [o["1"], o["2"]].filter(Boolean).join(" ／ "); }],
+    [`Google（${name}→中）`, () => googleOne(text, sl, "zh-CN")],
   ];
-  return Promise.all(engines.map(async ([name, fn]) => { try { const z = await fn(); return { name, zh: okZh(z) ? toSimp(z) : "", err: okZh(z) ? "" : "无结果" }; } catch (e) { return { name, zh: "", err: e.message }; } }));
+  if (sl !== "en") engines.push([`Google（${name}→英→中）`, async () => googleOne(await googleOne(text, sl, "en"), "en", "zh-CN")]);
+  engines.push([`MyMemory（${name}→中）`, () => myMemoryPair(text, sl + "|zh-CN")]);
+  if (sl !== "en") engines.push([`MyMemory（${name}→英→中）`, async () => myMemoryPair(await myMemoryPair(text, sl + "|en"), "en|zh-CN")]);
+  engines.push(["Lingva", () => lingva(text)]);
+  return Promise.all(engines.map(async ([n, fn]) => { try { const z = await fn(); return { name: n, zh: okZh(z) ? toSimp(z) : "", err: okZh(z) ? "" : "无结果" }; } catch (e) { return { name: n, zh: "", err: e.message }; } }));
 }
 
-/* ---- word lookup: en.wiktionary (Italian section, follows "plural of"/form-of to lemma) → zh ---- */
+/* ---- word lookup (Wiktionary + English dictionary API; Jisho lacks CORS so JA uses Wiktionary + readings) ---- */
 const stripHtml = (s) => String(s || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-async function wiktIt(word) {
+async function wiktLang(word, code) {
   const r = await fetch("https://en.wiktionary.org/api/rest_v1/page/definition/" + encodeURIComponent(word));
   if (!r.ok) return null;
   const d = await r.json();
-  return d.it || null;
+  return d[code] || null;
 }
-async function lookupWord(raw) {
-  const w = raw.toLowerCase().replace(/^[^a-zàèéìíòóù]*(?:[a-z]+['’])?/i, (m) => (/['’]$/.test(m) ? "" : m)).replace(/[^a-zàèéìíòóù]/gi, "");
-  let lemma = w, entries = await wiktIt(w);
+function normalizeLookupWord(raw, lang = curLang) {
+  const s = String(raw || "").trim();
+  if (lang === "ja") return s.replace(/\s+/g, "");
+  if (lang === "en") return s.toLowerCase().replace(/^[^a-zA-Z']+|[^a-zA-Z']+$/g, "");
+  return s.toLowerCase().replace(/^[^a-zàèéìíòóù]*(?:[a-z]+['’])?/i, (m) => (/['’]$/.test(m) ? "" : m)).replace(/[^a-zàèéìíòóù]/gi, "");
+}
+async function wiktFollowLemma(word, code) {
+  let lemma = word, entries = await wiktLang(word, code);
   if (entries) {
     const html = JSON.stringify(entries);
     const m = html.match(/form-of-definition-link[^]*?<a[^>]*title=\\"([^"\\]+)\\"/);
-    const senses = entries.flatMap((e) => e.definitions.map((x) => stripHtml(x.definition))).filter(Boolean);
-    if (m && senses.every((s) => /\b(of|form)\b/.test(s) && s.length < 60)) { lemma = m[1]; entries = (await wiktIt(lemma)) || entries; }
+    const senses = entries.flatMap((e) => (e.definitions || []).map((x) => stripHtml(x.definition))).filter(Boolean);
+    if (m && senses.every((s) => /\b(of|form)\b/.test(s) && s.length < 60)) { lemma = m[1]; entries = (await wiktLang(lemma, code)) || entries; }
   }
+  return { lemma, entries };
+}
+async function jaReading(word) {
+  try {
+    const url = "https://en.wiktionary.org/w/api.php?" + new URLSearchParams({ action: "query", prop: "revisions", rvprop: "content", rvslots: "main", titles: word, format: "json", origin: "*" });
+    const j = await (await fetch(url)).json();
+    const pages = (j.query || {}).pages || {};
+    const content = (Object.values(pages)[0] || {}).revisions?.[0]?.slots?.main?.["*"] || "";
+    const m = content.match(/\{\{ja-pron\|([^}|]+)/) || content.match(/\{\{ja-verb\|([^}|]+)/) || content.match(/\{\{ja-noun\|[^|]*\|([^}|]+)/);
+    if (m) return m[1].replace(/[-.]/g, "");
+  } catch (e) {}
+  return "";
+}
+async function lookupJisho(word) {
+  // Jisho has no Access-Control-Allow-Origin; this succeeds only if that changes.
+  const r = await fetch("https://jisho.org/api/v1/search/words?keyword=" + encodeURIComponent(word));
+  if (!r.ok) return null;
+  const d = await r.json();
+  const hit = (d.data || [])[0];
+  if (!hit) return null;
+  const reading = ((hit.japanese || [])[0] || {}).reading || "";
+  const lemma = ((hit.japanese || [])[0] || {}).word || word;
+  const senses = (hit.senses || []).slice(0, 5).map((s) => {
+    const en = (s.english_definitions || []).join("; ");
+    return { pos: (s.parts_of_speech || []).join(", "), en };
+  }).filter((s) => s.en);
+  return { lemma, reading, senses };
+}
+async function lookupFreeDictEn(word) {
+  const r = await fetch("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(word));
+  if (!r.ok) return null;
+  const d = await r.json();
+  const entry = Array.isArray(d) ? d[0] : null;
+  if (!entry) return null;
   const senses = [];
-  (entries || []).forEach((e) => e.definitions.forEach((x) => { const t = stripHtml(x.definition); if (t) senses.push({ pos: e.partOfSpeech, en: t }); }));
+  (entry.meanings || []).forEach((m) => (m.definitions || []).forEach((x) => {
+    if (x.definition) senses.push({ pos: m.partOfSpeech || "", en: x.definition });
+  }));
+  const phon = (entry.phonetic || ((entry.phonetics || [])[0] || {}).text || "").trim();
+  return { lemma: entry.word || word, reading: phon, senses: senses.slice(0, 5) };
+}
+async function lookupWord(raw) {
+  const lang = curLang;
+  const w = normalizeLookupWord(raw, lang);
+  if (!w) return { word: raw, lemma: raw, reading: "", senses: [], google: "" };
+  let lemma = w, reading = "", entries = null, sensesIn = [];
+  if (lang === "en") {
+    const fd = await lookupFreeDictEn(w).catch(() => null);
+    if (fd && fd.senses.length) { lemma = fd.lemma || w; reading = fd.reading || ""; sensesIn = fd.senses; }
+    if (!sensesIn.length) {
+      const wk = await wiktFollowLemma(w, "en");
+      lemma = wk.lemma; entries = wk.entries;
+    }
+  } else if (lang === "ja") {
+    const js = await lookupJisho(w).catch(() => null);
+    if (js && js.senses.length) { lemma = js.lemma || w; reading = js.reading || ""; sensesIn = js.senses; }
+    if (!sensesIn.length) {
+      const wk = await wiktFollowLemma(w, "ja");
+      lemma = wk.lemma; entries = wk.entries;
+    }
+    if (!reading) reading = await jaReading(lemma || w);
+  } else {
+    const wk = await wiktFollowLemma(w, "it");
+    lemma = wk.lemma; entries = wk.entries;
+  }
+  const senses = sensesIn.slice();
+  (entries || []).forEach((e) => (e.definitions || []).forEach((x) => { const t = stripHtml(x.definition); if (t) senses.push({ pos: e.partOfSpeech, en: t }); }));
   const top = senses.slice(0, 5);
   const zhs = await Promise.all(top.map((s) => myMemoryPair(s.en.split(/[;(]/)[0].slice(0, 120), "en|zh-CN").then(toSimp).catch(() => "")));
   top.forEach((s, i) => (s.zh = okZh(zhs[i]) ? zhs[i] : ""));
   let google = "";
   try {
-    const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&sl=it&tl=zh-CN&dt=t&dt=bd&q=" + encodeURIComponent(lemma));
+    const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&sl=" + srcCode() + "&tl=zh-CN&dt=t&dt=bd&q=" + encodeURIComponent(lemma));
     if (r.ok) { const d = await r.json(); google = (d[1] || []).map((p) => p[0] + "：" + (p[1] || []).slice(0, 6).join("、")).join("；") || ((d[0] || [])[0] || [])[0] || ""; }
   } catch (e) {}
-  return { word: w, lemma, senses: top, google: toSimp(google) };
+  return { word: w, lemma, reading, senses: top, google: toSimp(google) };
 }
-const VOCAB_KEY = "miraa-vocab";
-const getVocab = () => { try { return JSON.parse(localStorage.getItem(VOCAB_KEY) || "[]"); } catch (e) { return []; } };
-const setVocab = (v) => { try { localStorage.setItem(VOCAB_KEY, JSON.stringify(v)); } catch (e) {} };
+const getVocab = () => { try { return JSON.parse(localStorage.getItem(lsKey("vocab")) || "[]"); } catch (e) { return []; } };
+const setVocab = (v) => { try { localStorage.setItem(lsKey("vocab"), JSON.stringify(v)); } catch (e) {} };
 
 function modal(html) {
   let m = $("modal");
@@ -558,22 +735,27 @@ function modal(html) {
   m.querySelector(".mbody").innerHTML = html; m.hidden = false; return m.querySelector(".mbody");
 }
 const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function rubyTitle(word, reading) {
+  if (reading && reading !== word) return `<ruby>${esc(word)}<rt>${esc(reading)}</rt></ruby>`;
+  return esc(word);
+}
 async function showWord(word, sentence, lessonId) {
   const body = modal(`<h3>${esc(word)}</h3><p class="muted">查询中…</p>`);
   const r = await lookupWord(word);
-  body.innerHTML = `<h3>${esc(r.word)}${r.lemma !== r.word ? ` <span class="muted">← 原形 ${esc(r.lemma)}</span>` : ""}</h3>
+  body.innerHTML = `<h3>${rubyTitle(r.word, r.reading)}${r.lemma !== r.word ? ` <span class="muted">← 原形 ${esc(r.lemma)}</span>` : ""}</h3>
     ${r.google ? `<p><b>词典：</b>${esc(r.google)}</p>` : ""}
     ${r.senses.length ? "<ol>" + r.senses.map((s) => `<li>${s.zh ? `<b>${esc(s.zh)}</b> · ` : ""}<span class="muted">${esc(s.pos)} · ${esc(s.en)}</span></li>`).join("") + "</ol>" : '<p class="muted">词典里没查到。</p>'}
     <p class="muted">例句：${esc(sentence)}</p><button type="button" class="primary" id="addVocab">加入生词本</button>`;
   body.querySelector("#addVocab").onclick = () => {
     const v = getVocab().filter((x) => x.lemma !== r.lemma);
-    v.unshift({ word: r.word, lemma: r.lemma, zh: r.senses.map((s) => s.zh).filter(Boolean).slice(0, 3).join("；") || r.google, sentence, lessonId, t: Date.now() });
+    v.unshift({ word: r.word, lemma: r.lemma, reading: r.reading || "", zh: r.senses.map((s) => s.zh).filter(Boolean).slice(0, 3).join("；") || r.google, sentence, lessonId, lang: curLang, t: Date.now() });
     setVocab(v); body.querySelector("#addVocab").textContent = "已加入 ✓";
   };
 }
 function showVocab() {
   const v = getVocab();
-  const body = modal(`<h3>生词本（${v.length}）</h3>` + (v.length ? v.map((x, i) => `<div class="vrow"><b>${esc(x.lemma)}</b>${x.word !== x.lemma ? ` (${esc(x.word)})` : ""} — ${esc(x.zh)}<div class="muted">${esc(x.sentence)}</div><button type="button" data-i="${i}">删除</button></div>`).join("") : '<p class="muted">还没有生词。在课程里点意大利语单词即可查询并加入。</p>'));
+  const empty = `<p class="muted">还没有生词。在课程里点${srcName()}单词即可查询并加入。</p>`;
+  const body = modal(`<h3>${srcName()}生词本（${v.length}）</h3>` + (v.length ? v.map((x, i) => `<div class="vrow"><b>${x.reading ? `<ruby>${esc(x.lemma)}<rt>${esc(x.reading)}</rt></ruby>` : esc(x.lemma)}</b>${x.word !== x.lemma ? ` (${esc(x.word)})` : ""} — ${esc(x.zh)}<div class="muted">${esc(x.sentence)}</div><button type="button" data-i="${i}">删除</button></div>`).join("") : empty));
   body.querySelectorAll("button[data-i]").forEach((b) => (b.onclick = () => { const a2 = getVocab(); a2.splice(Number(b.dataset.i), 1); setVocab(a2); showVocab(); }));
 }
 
@@ -641,14 +823,14 @@ function waitWorker(onProgress) {
 async function loadModel(modelId, onProgress) {
   const w = ensureWorker();
   const p = waitWorker(onProgress);
-  w.postMessage({ type: "load", modelId, preferGpu: !IS_IOS });
+  w.postMessage({ type: "load", modelId, preferGpu: !IS_IOS, language: langCfg().whisper });
   return p;
 }
 
 async function transcribeChunk(pcmChunk, offset) {
   const w = ensureWorker();
   const p = waitWorker();
-  w.postMessage({ type: "chunk", audio: pcmChunk, offset }, [pcmChunk.buffer]);
+  w.postMessage({ type: "chunk", audio: pcmChunk, offset, language: langCfg().whisper }, [pcmChunk.buffer]);
   return p;
 }
 
@@ -683,8 +865,8 @@ async function processFile(file) {
   dbg("音频长度 " + decoded.duration.toFixed(1) + "s，压缩保存中");
   const audioBlob = encodeMp3(pcm) || encodeWav(pcm);
   const job = {
-    title: (decodedTitle || "意大利语跟读"), createdAt: Date.now(), duration: decoded.duration,
-    audio: audioBlob, audioMime: audioBlob.type, video: videoBlob, model: modelSel.value, segments: [], doneSec: 0,
+    title: (decodedTitle || (srcName() + "跟读")), createdAt: Date.now(), duration: decoded.duration,
+    audio: audioBlob, audioMime: audioBlob.type, video: videoBlob, model: modelSel.value, lang: curLang, segments: [], doneSec: 0,
   };
   await saveJob(job);
   dbg("已保存可续做的进度（释放音频内存后再加载模型）");
@@ -701,11 +883,11 @@ async function resumeJob() {
 }
 
 async function runJob(job) {
-  let modelId = job.model || TINY;
-  const prevCrash = localStorage.getItem(LOADING_KEY);
+  let modelId = job.model || langCfg().tiny;
+  const prevCrash = localStorage.getItem(loadingKey());
   if (prevCrash && prevCrash !== TINY) { const fb = fallbackOf(prevCrash); dbg(`上次用 ${prevCrash} 时页面刷新，改用 ${fb}`); modelId = fb; }
   job.model = modelId; await saveJob(job);
-  try { localStorage.setItem(LOADING_KEY, modelId); } catch (e) {}
+  try { localStorage.setItem(loadingKey(), modelId); } catch (e) {}
   const meta = MODELS[modelId] || { label: modelId, downloadMB: "?" };
   setWork("正在加载语音识别模型…", `首次需要下载约 ${meta.downloadMB} MB`, 20);
   dbg("加载模型 " + modelId);
@@ -756,7 +938,7 @@ async function runJob(job) {
     if (cancelled) return;
     const end = Math.min(total, start + CH);
     const from = Math.max(0, start - (start > 0 ? OV : 0));
-    setWork("正在识别意大利语…", `已处理 ${fmtDur(start / RATE)} / ${fmtDur(total / RATE)}`, 40 + (start / total) * 38);
+    setWork(`正在识别${srcName()}…`, `已处理 ${fmtDur(start / RATE)} / ${fmtDur(total / RATE)}`, 40 + (start / total) * 38);
     dbg(`识别 ${Math.round(from / RATE)}–${Math.round(end / RATE)}s`);
     let res;
     try { res = await transcribeChunk(pcm.slice(from, end), from / RATE); }
@@ -779,7 +961,7 @@ async function runJob(job) {
     await saveJob(job);
   }
   const transcribeMs = performance.now() - t0;
-  try { localStorage.removeItem(LOADING_KEY); } catch (e) {}
+  try { localStorage.removeItem(loadingKey()); } catch (e) {}
   dbg(`识别完成 ${job.segments.length} 段`);
   const sentences = toSentenceSegments(job.segments);
   setWork("正在翻译成中文…", `0 / ${sentences.length}`, 80);
@@ -790,7 +972,7 @@ async function runJob(job) {
   dbg(`翻译 ${tr.ok}/${sentences.length}`);
   const lesson = {
     id: "L" + Date.now().toString(36), title: job.title, createdAt: job.createdAt, duration: job.duration,
-    model: modelId, device: ready.device, dtype: ready.dtype, translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], transcribeMs,
+    model: modelId, device: ready.device, dtype: ready.dtype, lang: job.lang || curLang, translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], transcribeMs,
     audioMime: job.audioMime, audio: job.audio, video: job.video || null,
     sentences: sentences.map((s, i) => ({ i, start: Math.round(s.start * 1000) / 1000, end: Math.round(s.end * 1000) / 1000, it: s.text, zh: tr.zh[i] || "" })),
   };
@@ -837,7 +1019,7 @@ async function processWithSrt(media, srtText) {
   try { tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 30 + (i / n) * 65), media.name); } catch (e) {}
   const lesson = {
     id: "L" + Date.now().toString(36), title: media.name.replace(/\.[^.]+$/, ""), createdAt: Date.now(), duration,
-    model: "srt", device: "-", dtype: "-", translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], audioMime: audio.type, audio, video: videoBlob,
+    model: "srt", device: "-", dtype: "-", lang: curLang, translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], audioMime: audio.type, audio, video: videoBlob,
     sentences: sentences.map((s, i) => ({ i, start: Math.round(s.start * 1000) / 1000, end: Math.round(s.end * 1000) / 1000, it: s.text, zh: tr.zh[i] || "" })),
   };
   await putLesson(lesson);
@@ -876,14 +1058,14 @@ async function openLesson(id, preloaded) {
   $("btnSubMode").hidden = !lesson.video;
   $("orig").removeAttribute("src"); $("vid").removeAttribute("src");
   (lesson.video ? $("vid") : $("orig")).src = currentAudioUrl || "";
-  $("playerTitle").textContent = lesson.title || "意大利语跟读";
+  $("playerTitle").textContent = lesson.title || (srcName() + "跟读");
   $("playerMeta").textContent = [
     (lesson.sentences || []).length + " 句",
     fmtDur(lesson.duration),
-    "意大利语 → 简体中文",
+    srcName() + " → 简体中文",
   ].filter(Boolean).join(" · ");
   const sb = $("sceneBox");
-  const gl = (lesson.glossary || []).map((g) => `${esc(g.it)}＝${esc(g.zh)}`).join("　");
+  const gl = (lesson.glossary || []).map((g) => `${esc(g.src || g.it || g.en || g.ja || "")}＝${esc(g.zh)}`).join("　");
   sb.innerHTML = lesson.summary ? `<b>场景：</b>${esc(lesson.summary)}${gl ? `<div class="muted" style="margin-top:4px">词义：${gl}</div>` : ""}` : "";
   sb.hidden = !lesson.summary;
   showView("player");
@@ -893,13 +1075,13 @@ async function openLesson(id, preloaded) {
 
 function attachPlayer(lesson, audioSrc) {
   const sentences = lesson.sentences || [];
-  const storageKey = "miraa:" + (lesson.id || "lesson");
+  const storageKey = "miraa-" + (lesson.lang || curLang) + ":" + (lesson.id || "lesson");
   const listEl = $("list");
   const orig = lesson.video ? $("vid") : $("orig");
   const subIt = document.querySelector("#sub .sit"), subZh = document.querySelector("#sub .szh");
-  const SUBMODES = ["双语", "意大利语", "中文", "关闭"];
+  const SUBMODES = ["双语", srcName(), "中文", "关闭"];
   let subMode = 0;
-  try { subMode = Number(localStorage.getItem("miraa-submode") || 0) % 4; } catch (e) {}
+  try { subMode = Number(localStorage.getItem(lsKey("submode")) || 0) % 4; } catch (e) {}
   const btnSubMode = $("btnSubMode");
   btnSubMode.textContent = "字幕：" + SUBMODES[subMode];
   function adjT() { return (orig.currentTime || 0) - subOffset; }
@@ -995,10 +1177,10 @@ function attachPlayer(lesson, audioSrc) {
       el.querySelector(".idx").textContent = (i + 1) + " / " + sentences.length + " · " + fmt(s.start);
       el.querySelector(".star").textContent = isFav(i) ? "★" : "☆";
       const itEl = el.querySelector(".it");
-      (s.it || "").split(/(\s+)/).forEach((tok) => {
-        if (/^\s+$/.test(tok) || !tok) { itEl.appendChild(document.createTextNode(tok)); return; }
-        const sp = document.createElement("span"); sp.className = "w"; sp.textContent = tok;
-        sp.addEventListener("click", (e) => { if (i !== idx) return; e.stopPropagation(); showWord(tok, s.it, lesson.id); });
+      tokenizeText(s.it || "", lesson.lang || curLang).forEach((tok) => {
+        if (!tok.word) { itEl.appendChild(document.createTextNode(tok.t)); return; }
+        const sp = document.createElement("span"); sp.className = "w"; sp.textContent = tok.t;
+        sp.addEventListener("click", (e) => { if (i !== idx) return; e.stopPropagation(); showWord(tok.t, s.it, lesson.id); });
         itEl.appendChild(sp);
       });
       const around = () => sentences.slice(Math.max(0, i - 2), i + 3).map((x) => x.it).join(" ");
@@ -1027,7 +1209,7 @@ function attachPlayer(lesson, audioSrc) {
       el.querySelector(".play-mine").addEventListener("click", (e) => { e.stopPropagation(); playMine(i); });
       el.querySelector(".edit").addEventListener("click", async (e) => {
         e.stopPropagation();
-        const nt = prompt("修改这句意大利语（保存后会重新翻译）：", s.it);
+        const nt = prompt("修改这句" + srcName() + "（保存后会重新翻译）：", s.it);
         if (nt == null || !nt.trim() || nt.trim() === s.it) return;
         s.it = nt.trim();
         s.zh = "翻译中…"; renderList();
@@ -1183,7 +1365,7 @@ function attachPlayer(lesson, audioSrc) {
   }
   renderOffset();
   on(orig, "timeupdate", onTick); // backup when rAF is throttled; no extra seeks in continuous mode
-  on(btnSubMode, "click", () => { subMode = (subMode + 1) % 4; btnSubMode.textContent = "字幕：" + SUBMODES[subMode]; try { localStorage.setItem("miraa-submode", subMode); } catch (e) {} showSub(adjT()); });
+  on(btnSubMode, "click", () => { subMode = (subMode + 1) % 4; btnSubMode.textContent = "字幕：" + SUBMODES[subMode]; try { localStorage.setItem(lsKey("submode"), subMode); } catch (e) {} showSub(adjT()); });
   on(orig, "ended", onEnded);
   on(btnPlay, "click", () => {
     if (playing) { pauseAll(); return; }
@@ -1312,7 +1494,7 @@ async function exportCurrentLesson() {
   const payload = {
     id: L.id,
     title: L.title,
-    language: "it",
+    language: L.lang || curLang, language_name: srcName(),
     translation: "zh-CN",
     duration: L.duration,
     created_at: new Date(L.createdAt || Date.now()).toISOString(),
@@ -1358,7 +1540,7 @@ function blobToBase64(blob) {
 const EXPORT_TEMPLATE = `<!DOCTYPE html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#1f3a2e"><title>意大利语跟读</title>
+<meta name="theme-color" content="#1f3a2e"><title>外语跟读</title>
 <style>
 :root{--bg:#f4efe6;--paper:#fffaf2;--ink:#1c241e;--muted:#6b6458;--line:#e4d8c4;--accent:#1f3a2e;--accent-2:#c45c26;--hl:#ffe7c2;--hl-border:#e8b86a;--shadow:0 8px 28px rgba(40,28,12,.08);--safe-bottom:env(safe-area-inset-bottom,0px);--bar-h:0px}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;padding:0}
@@ -1402,7 +1584,7 @@ body.hide-zh .sentence.current .hide-note{display:block}
 .warn{background:#fff1e4;color:#7a3a10;border:1px solid #f0c9a0;border-radius:12px;padding:10px 12px;margin:0 0 12px;font-size:.86rem}
 audio{display:none}
 </style></head><body>
-<header><div class="head-row"><div><h1 id="title">意大利语跟读</h1><div class="meta" id="meta"></div></div>
+<header><div class="head-row"><div><h1 id="title">外语跟读</h1><div class="meta" id="meta"></div></div>
 <div class="toggles"><button class="icon-btn" id="btnFavFilter" aria-pressed="false" title="只看收藏">★</button></div></div>
 <div class="toolbar"><button type="button" id="btnZh" aria-pressed="true">隐藏译文</button><button type="button" id="btnLoop">循环本句</button><button type="button" id="btnPauseEach">逐句暂停</button></div></header>
 <main><div id="secureNote" class="warn" hidden>当前页面不是安全环境，麦克风录音可能不可用。跟读播放通常仍可用。</div>
@@ -1424,10 +1606,10 @@ const LESSON = __LESSON_JSON__;
   const pbar=document.getElementById("pbar"), nowIt=document.getElementById("nowIt");
   const btnPlay=document.getElementById("btnPlay"), btnLoop=document.getElementById("btnLoop"), btnLoop2=document.getElementById("btnLoop2");
   const btnZh=document.getElementById("btnZh"), btnFavFilter=document.getElementById("btnFavFilter"), btnRec=document.getElementById("btnRec"), speedEl=document.getElementById("speed");
-  document.getElementById("title").textContent=LESSON.title||"意大利语跟读";
-  document.title=(LESSON.title||"意大利语跟读")+" · 跟读";
+  document.getElementById("title").textContent=LESSON.title||"外语跟读";
+  document.title=(LESSON.title||"外语跟读")+" · 跟读";
   function fmt(t){t=Math.max(0,t||0);const m=Math.floor(t/60),s=Math.floor(t%60);return m+":"+String(s).padStart(2,"0")}
-  document.getElementById("meta").textContent=[sentences.length+" 句", LESSON.duration?fmt(LESSON.duration):"","意大利语 → 简体中文"].filter(Boolean).join(" · ");
+  document.getElementById("meta").textContent=[sentences.length+" 句", LESSON.duration?fmt(LESSON.duration):"",(LESSON.language_name||"外语")+" → 简体中文"].filter(Boolean).join(" · ");
   if(LESSON.audio_src) orig.src=LESSON.audio_src; else document.getElementById("noAudio").hidden=false;
   if(!(window.isSecureContext||location.protocol==="https:"||location.hostname==="localhost")) document.getElementById("secureNote").hidden=false;
   let state={last:0,favorites:[],hideZh:false};
@@ -1517,39 +1699,100 @@ const LESSON = __LESSON_JSON__;
 })();
 </script></body></html>`;
 
-/* ---------------- boot ---------------- */
-function boot() {
-  if (!isSecure()) $("secureNote").hidden = false;
-  dbg("设备：" + navigator.userAgent.slice(0, 120) + " · deviceMemory=" + (navigator.deviceMemory || "?") + "GB · cores=" + (navigator.hardwareConcurrency || "?"));
-  const crashed = localStorage.getItem(LOADING_KEY);
-  if (crashed && crashed !== TINY) {
-    const fb = fallbackOf(crashed);
+/* ---------------- language UI ---------------- */
+function fillModelSelect() {
+  const L = langCfg();
+  const prev = modelSel.value;
+  modelSel.innerHTML = "";
+  L.models.forEach((id) => {
+    const m = MODEL_CATALOG[id]; if (!m) return;
+    const opt = document.createElement("option");
+    opt.value = id;
+    const kind = m.enOnly ? "英语专用，" : (L.id === "en" && !m.enOnly ? "多语，" : "");
+    const rec = id === L.tiny ? "推荐，" : "";
+    const speed = id.includes("small") ? "最准 · " : id.includes("base") ? "较准 · " : "快速 · ";
+    opt.textContent = `${speed}${m.label}（约 ${m.downloadMB} MB，${kind}${rec}`.replace(/，$/, "") + "）";
+    modelSel.appendChild(opt);
+  });
+  let saved = null;
+  try { saved = localStorage.getItem(modelKey()); } catch (e) {}
+  if (saved && L.models.includes(saved)) modelSel.value = saved;
+  else if (L.models.includes(prev)) modelSel.value = prev;
+  else modelSel.value = L.tiny;
+}
+function applyCrashNotes() {
+  const crashed = localStorage.getItem(loadingKey());
+  if ($("baseCrashNote")) $("baseCrashNote").hidden = true;
+  if ($("tinyCrashNote")) $("tinyCrashNote").hidden = true;
+  if (!crashed) return;
+  const fb = fallbackOf(crashed);
+  if (fb && fb !== crashed) {
+    try { localStorage.setItem(modelKey(), fb); } catch (e) {}
     dbg(`检测到上次用 ${crashed} 时页面被重新加载（多半内存不足），已切换为 ${fb}`);
-    try { localStorage.setItem("miraa-phone-model", fb); } catch (e) {}
-    $("baseCrashNote").textContent = `上次用「${(MODELS[crashed] || {}).label}」时页面被刷新了：这台手机在这个浏览器里内存不够。已自动换成「${MODELS[fb].label}」。如有未完成的课，可点下方「继续上次」接着做。`;
-    $("baseCrashNote").hidden = false;
+    if ($("baseCrashNote")) {
+      $("baseCrashNote").textContent = `上次用「${(MODELS[crashed] || {}).label || crashed}」时页面被刷新了：这台手机在这个浏览器里内存不够。已自动换成「${(MODELS[fb] || {}).label || fb}」。如有未完成的课，可点下方「继续上次」接着做。`;
+      $("baseCrashNote").hidden = false;
+    }
+    if (modelSel.querySelector('option[value="' + fb + '"]')) modelSel.value = fb;
+  } else if ($("tinyCrashNote")) {
+    $("tinyCrashNote").hidden = false;
   }
+}
+function applyLangUI() {
+  const L = langCfg();
+  document.title = "外语跟读 · " + L.name;
+  if ($("appTitle")) $("appTitle").textContent = "外语跟读";
+  if ($("appSub")) $("appSub").textContent = "当前：" + L.name + "。在手机上选择音视频，生成可跟读的课程。";
+  document.querySelectorAll("#langSwitch [data-lang]").forEach((b) => {
+    const on = b.dataset.lang === curLang;
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.classList.toggle("on", on);
+  });
+  fillModelSelect();
+  applyCrashNotes();
+}
+async function updateResumeBox() {
+  try {
+    const j = await getLesson(JOB_ID);
+    if (j) { $("resumeBox").hidden = false; $("resumeInfo").textContent = `「${j.title}」已识别 ${Math.round(j.doneSec || 0)} / ${Math.round(j.duration || 0)} 秒`; }
+    else $("resumeBox").hidden = true;
+  } catch (e) { if ($("resumeBox")) $("resumeBox").hidden = true; }
+}
+async function setLang(id) {
+  if (!LANGS[id]) return;
+  if (id === curLang) { applyLangUI(); return; }
+  curLang = id;
+  try { localStorage.setItem("miraa-lang", id); } catch (e) {}
+  applyLangUI();
+  await refreshLibrary();
+  await updateResumeBox();
+}
+
+/* ---------------- boot ---------------- */
+async function boot() {
+  if (!isSecure()) $("secureNote").hidden = false;
+  try { const s = localStorage.getItem("miraa-lang"); if (LANGS[s]) curLang = s; } catch (e) {}
+  dbg("设备：" + navigator.userAgent.slice(0, 120) + " · deviceMemory=" + (navigator.deviceMemory || "?") + "GB · cores=" + (navigator.hardwareConcurrency || "?") + " · 语言=" + srcName());
+  await migrateItalianIfNeeded();
+  applyLangUI();
+  const sw = $("langSwitch");
+  if (sw) sw.addEventListener("click", (e) => { const b = e.target.closest("[data-lang]"); if (b) setLang(b.dataset.lang); });
   modelSel.addEventListener("change", () => {
     const m = modelSel.value;
-    if (m === TINY) return;
-    const key = "miraa-confirmed-" + m;
-    if (localStorage.getItem(key)) return;
-    const info = m === SMALL
-      ? "whisper-small 约 242 MB，首次下载较久；识别速度约为 tiny 的 4–6 倍慢，手机可能发烫，内存不足时页面会刷新（会自动退回 base）。确定使用？"
-      : "whisper-base 约 77 MB，首次需下载；比 tiny 准，速度约慢 2 倍。确定使用？";
-    if (confirm(info)) localStorage.setItem(key, "1");
-    else { modelSel.value = TINY; modelSel.dispatchEvent(new Event("change")); }
+    const key = confirmKey(m);
+    if (m !== langCfg().tiny && !localStorage.getItem(key)) {
+      const info = m.includes("small")
+        ? "whisper-small 约 242 MB，首次下载较久；识别速度约为 tiny 的 4–6 倍慢，手机可能发烫，内存不足时页面会刷新（会自动退回更小模型）。确定使用？"
+        : ((MODELS[m] || {}).enOnly
+          ? `${MODELS[m].label} 约 ${MODELS[m].downloadMB} MB，英语专用，通常比多语同一规格更准。确定使用？`
+          : `${(MODELS[m] || {}).label || m} 约 ${(MODELS[m] || {}).downloadMB || "?"} MB，首次需下载。确定使用？`);
+      if (confirm(info)) localStorage.setItem(key, "1");
+      else { modelSel.value = langCfg().tiny; }
+    }
+    try { localStorage.setItem(modelKey(), modelSel.value); } catch (e) {}
   });
-  try {
-    const saved = localStorage.getItem("miraa-phone-model");
-    if (saved && MODELS[saved]) modelSel.value = saved;
-  } catch (e) {}
-  modelSel.addEventListener("change", () => {
-    try { localStorage.setItem("miraa-phone-model", modelSel.value); } catch (e) {}
-  });
-  if (localStorage.getItem(LOADING_KEY) === TINY) $("tinyCrashNote").hidden = false;
   let srtMediaFile = null;
-  $("btnSrt").addEventListener("click", () => { alert("第 1 步：选择音视频文件；第 2 步：选择对应的意大利语 .srt 字幕"); $("srtMedia").click(); });
+  $("btnSrt").addEventListener("click", () => { alert("第 1 步：选择音视频文件；第 2 步：选择对应的" + srcName() + " .srt 字幕"); $("srtMedia").click(); });
   $("srtMedia").addEventListener("change", () => { srtMediaFile = $("srtMedia").files[0]; $("srtMedia").value = ""; if (srtMediaFile) $("srtFile").click(); });
   $("srtFile").addEventListener("change", async () => { const f = $("srtFile").files[0]; $("srtFile").value = ""; if (f && srtMediaFile) processWithSrt(srtMediaFile, await f.text()); });
   $("btnVocab").addEventListener("click", showVocab);
@@ -1557,7 +1800,7 @@ function boot() {
   filePick.addEventListener("change", () => {
     const f = filePick.files && filePick.files[0];
     filePick.value = "";
-    if (f) { decodedTitle = (f.name || "意大利语跟读").replace(/\.[^.]+$/, ""); processFile(f); }
+    if (f) { decodedTitle = (f.name || (srcName() + "跟读")).replace(/\.[^.]+$/, ""); processFile(f); }
   });
   $("btnCancelWork").addEventListener("click", () => {
     cancelled = true;
@@ -1576,16 +1819,13 @@ function boot() {
   $("btnExport").addEventListener("click", () => exportCurrentLesson());
   renderDebug();
   $("btnClearDbg").addEventListener("click", () => { localStorage.setItem(DBG_KEY, "[]"); renderDebug(); });
-  getLesson(JOB_ID).then((j) => {
-    if (j) { $("resumeBox").hidden = false; $("resumeInfo").textContent = `「${j.title}」已识别 ${Math.round(j.doneSec)} / ${Math.round(j.duration)} 秒`; }
-  }).catch(() => {});
+  updateResumeBox();
   $("btnResume").addEventListener("click", () => resumeJob());
   $("btnDropJob").addEventListener("click", async () => { await clearJob(); $("resumeBox").hidden = true; });
   window.addEventListener("error", (e) => dbg("JS错误：" + e.message));
   window.addEventListener("unhandledrejection", (e) => dbg("未处理错误：" + ((e.reason && e.reason.message) || e.reason)));
   refreshLibrary();
 
-  // Expose a small hook for automated tests (localhost only).
   window.__miraa = {
     processFile,
     processWithSrt,
@@ -1593,7 +1833,16 @@ function boot() {
     getLesson,
     putLesson,
     openLesson,
+    setLang,
+    getLang: () => curLang,
+    lookupWord,
+    getVocab,
+    langCfg,
+    tokenizeText,
+    toSentenceSegments,
+    migrateItalianIfNeeded,
   };
 }
+
 
 boot();

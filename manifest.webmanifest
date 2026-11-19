@@ -1,6 +1,6 @@
 {
-  "name": "意大利语跟读",
-  "short_name": "意语跟读",
+  "name": "外语跟读",
+  "short_name": "外语跟读",
   "lang": "zh-CN",
   "start_url": "./index.html",
   "display": "standalone",

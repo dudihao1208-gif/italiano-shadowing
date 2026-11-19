@@ -6,8 +6,8 @@
 <meta name="theme-color" content="#1f3a2e">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="description" content="在手机浏览器里把意大利语音视频做成跟读课：本地识别、中文译文、离线回看。">
-<title>意大利语跟读</title>
+<meta name="description" content="在手机浏览器里把外语音视频做成跟读课：意大利语、英语、日语分开展示，本地识别、中文译文、离线回看。">
+<title>外语跟读</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <style>
@@ -203,12 +203,21 @@
   .offset-box { display: inline-flex; align-items: center; gap: 4px; }
   .offset-box button { min-width: 36px; padding: 6px 10px; }
   #offsetVal { font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 6.2em; text-align: center; }
+  .lang-switch { display: flex; gap: 8px; margin: 0 0 10px; }
+  .lang-switch button { flex: 1; font-size: .9rem; }
+  ruby { ruby-position: over; }
+  ruby rt { font-size: .6em; color: var(--muted); }
 </style>
 </head>
 <body class="view-lib">
 <header id="appHead">
-  <h1>意大利语跟读</h1>
-  <div class="sub">在手机上选择音视频，生成可跟读的意大利语课</div>
+  <div class="lang-switch" id="langSwitch" role="tablist" aria-label="学习语言">
+    <button type="button" data-lang="it" aria-pressed="true">意大利语</button>
+    <button type="button" data-lang="en" aria-pressed="false">英语</button>
+    <button type="button" data-lang="ja" aria-pressed="false">日语</button>
+  </div>
+  <h1 id="appTitle">外语跟读</h1>
+  <div class="sub" id="appSub">当前：意大利语。在手机上选择音视频，生成可跟读的课程。</div>
 </header>
 
 <main>
@@ -270,7 +279,7 @@
     </div>
     <div class="head-row">
       <div>
-        <h2 id="playerTitle">意大利语跟读</h2>
+        <h2 id="playerTitle">外语跟读</h2>
         <div id="playerMeta" class="meta"></div>
       </div>
       <div class="toggles">

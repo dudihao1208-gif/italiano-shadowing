@@ -19,6 +19,10 @@ async function initLib(plainWasm) {
 
 const RATE = 16000;
 const BLOCK = 90 * RATE; // 90 s blocks so a phone can show progress and stay memory-safe
+let asrLang = "italian";
+function asrBase() {
+  return { language: asrLang || "italian", task: "transcribe", chunk_length_s: 30, stride_length_s: 5 };
+}
 
 let transcriber = null;
 let loaded = { modelId: null, device: null, dtype: null };
@@ -141,7 +145,7 @@ function chunksFrom(result, offsetSec, blockDur) {
 }
 
 async function transcribePcm(pcm, offsetSec, blockDur) {
-  const base = { language: "italian", task: "transcribe", chunk_length_s: 30, stride_length_s: 5 };
+  const base = asrBase();
   try {
     const r = await transcriber(pcm, { ...base, return_timestamps: "word" });
     const segs = chunksFrom(r, offsetSec, blockDur);
@@ -193,6 +197,7 @@ async function transcribe(audio) {
 self.onmessage = async (ev) => {
   const msg = ev.data || {};
   try {
+    if (msg.language) asrLang = msg.language;
     if (msg.type === "load") {
       await loadModel(msg.modelId, msg.preferGpu !== false);
     } else if (msg.type === "transcribe") {
