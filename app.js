@@ -136,10 +136,11 @@ function mixMono(buf) {
 }
 
 function resampleLinear(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
+  fromRate = Number(fromRate); toRate = Number(toRate);
+  if (!fromRate || !toRate || fromRate === toRate) return input;
   const destLen = Math.max(1, Math.round(input.length * toRate / fromRate));
   const out = new Float32Array(destLen);
-  const ratio = input.length / destLen;
+  const ratio = fromRate / toRate; // exact sample-rate ratio, not destLen rounding
   for (let i = 0; i < destLen; i++) {
     const x = i * ratio;
     const i0 = Math.floor(x);
@@ -216,7 +217,7 @@ async function captureViaMediaElement(file, onProgress) {
     const n = ib.length, ch = ib.numberOfChannels;
     const m = new Float32Array(n);
     for (let c = 0; c < ch; c++) { const d = ib.getChannelData(c); for (let i = 0; i < n; i++) m[i] += d[i] / ch; }
-    parts.push(resampleLinear(m, ctx.sampleRate, RATE));
+    parts.push(m); // keep native ctx.sampleRate; resample once at the end
     if (onProgress) onProgress(media.currentTime / dur);
   };
   const mute = ctx.createGain(); mute.gain.value = 0;
@@ -228,9 +229,9 @@ async function captureViaMediaElement(file, onProgress) {
   try { await ctx.close(); } catch (e) {}
   URL.revokeObjectURL(url);
   let len = 0; parts.forEach((p) => (len += p.length));
-  const out = new Float32Array(len); let o = 0;
-  parts.forEach((p) => { out.set(p, o); o += p.length; });
-  return out;
+  const raw = new Float32Array(len); let o = 0;
+  parts.forEach((p) => { raw.set(p, o); o += p.length; });
+  return resampleLinear(raw, ctx.sampleRate, RATE);
 }
 
 async function decodeTo16kMono(file, onProgress) {
@@ -252,7 +253,7 @@ async function decodeTo16kMono(file, onProgress) {
     for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) mono[i] += d[i] / ch; }
     buf = null;
     const pcm = resampleLinear(mono, rate, RATE);
-    return { pcm, duration: pcm.length / RATE, sourceRate: rate };
+    return { pcm, duration: n / rate, sourceRate: rate };
   }
   const pcm = await captureViaMediaElement(file, onProgress);
   dbg("视频播放提取完成");
@@ -374,7 +375,8 @@ function toSentenceSegments(segments) {
     }
     const span = seg.end - buf[0].start;
     const gap = seg.start - buf[buf.length - 1].end;
-    if (gap > 1.2 || span > 18) {
+    const wordLike = buf.every((x) => (x.end - x.start) < 1.6 || (x.text || "").trim().split(/\s+/).length <= 3);
+    if (gap > (wordLike ? 0.7 : 1.2) || span > 18) {
       flush();
       buf = [seg];
     } else buf.push(seg);
@@ -725,20 +727,54 @@ async function runJob(job) {
   }
   let pcm;
   try {
-    pcm = (await decodeTo16kMono(new File([job.audio], "job.mp3", { type: job.audioMime || "audio/mpeg" }))).pcm;
+    // Prefer the original video so timestamps line up with playback (avoid MP3 encoder delay).
+    const src = job.video || job.audio;
+    const name = job.video ? "job.mp4" : "job.mp3";
+    const typ = job.video ? (job.video.type || "video/mp4") : (job.audioMime || "audio/mpeg");
+    pcm = (await decodeTo16kMono(new File([src], name, { type: typ }))).pcm;
   } catch (e) { dbg("重新解码失败：" + e.message); setWork("无法读取音频", String(e.message || e), 0); return; }
-  const CH = 30 * RATE;
+  const CH = 30 * RATE, OV = 5 * RATE;
+  let timeShift = 0;
+  if (!job.doneSec) {
+    const win = Math.round(0.03 * RATE), thr = 0.015;
+    let onset = 0;
+    for (let i = 0; i + win < pcm.length; i += win) {
+      let e = 0;
+      for (let j = 0; j < win; j++) e += pcm[i + j] * pcm[i + j];
+      if (Math.sqrt(e / win) > thr) { onset = i / RATE; break; }
+    }
+    const cut = Math.round(Math.max(0, onset - 0.2) * RATE);
+    if (cut > 0.25 * RATE) {
+      pcm = pcm.subarray(cut);
+      timeShift = cut / RATE;
+      dbg("去掉片头静音 " + timeShift.toFixed(2) + "s（保留 0.2s）");
+    }
+  }
   const total = pcm.length;
   const t0 = performance.now();
   for (let start = Math.round(job.doneSec * RATE); start < total; start += CH) {
     if (cancelled) return;
     const end = Math.min(total, start + CH);
+    const from = Math.max(0, start - (start > 0 ? OV : 0));
     setWork("正在识别意大利语…", `已处理 ${fmtDur(start / RATE)} / ${fmtDur(total / RATE)}`, 40 + (start / total) * 38);
-    dbg(`识别 ${Math.round(start / RATE)}–${Math.round(end / RATE)}s`);
+    dbg(`识别 ${Math.round(from / RATE)}–${Math.round(end / RATE)}s`);
     let res;
-    try { res = await transcribeChunk(pcm.slice(start, end), start / RATE); }
+    try { res = await transcribeChunk(pcm.slice(from, end), from / RATE); }
     catch (e) { dbg("识别失败：" + e.message); setWork("识别失败", e.message + "（可返回后点「继续上次」）", 0); return; }
-    job.segments.push(...(res.segments || []));
+    const segs = (res.segments || []).filter((s) => {
+      const mid = (Number(s.start) + Number(s.end)) / 2;
+      return mid >= start / RATE - 1e-3 && mid < end / RATE + 1e-3;
+    });
+    if (segs[0]) dbg("片段 " + segs.length + " 个，首 " + segs[0].start.toFixed(2) + "–" + segs[0].end.toFixed(2) + " " + (segs[0].text || "").slice(0, 40));
+    if (timeShift) {
+      // After trimming lead-in, Whisper often still stamps the first word at 0; snap it to the real onset.
+      if (start === 0 && segs[0] && segs[0].start < 0.35) {
+        const snap = Math.max(0, 0.2 - segs[0].start);
+        if (snap) segs.forEach((s) => { s.start += snap; s.end += snap; });
+      }
+      segs.forEach((s) => { s.start += timeShift; s.end += timeShift; });
+    }
+    job.segments.push(...segs);
     job.doneSec = end / RATE;
     await saveJob(job);
   }
@@ -792,13 +828,17 @@ async function processWithSrt(media, srtText) {
   try { const d = await decodeTo16kMono(media); pcm = d.pcm; duration = d.duration; }
   catch (e) { setWork("无法提取音频", String(e.message || e), 0); return; }
   const audio = encodeMp3(pcm) || encodeWav(pcm); pcm = null;
+  let videoBlob = null;
+  if ((media.type || "").startsWith("video/") || /\.(mp4|mov|m4v|webm)$/i.test(media.name || "")) {
+    if (media.size <= 300 * 1048576) videoBlob = media;
+  }
   const sentences = toSentenceSegments(segs);
   let tr = { zh: sentences.map(() => ""), method: "none", ok: 0 };
   try { tr = await translateSentences(sentences.map((s) => s.text), (i, n) => setWork("正在翻译成中文…", `${i} / ${n}`, 30 + (i / n) * 65), media.name); } catch (e) {}
   const lesson = {
     id: "L" + Date.now().toString(36), title: media.name.replace(/\.[^.]+$/, ""), createdAt: Date.now(), duration,
-    model: "srt", device: "-", dtype: "-", translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], audioMime: audio.type, audio,
-    sentences: sentences.map((s, i) => ({ i, start: s.start, end: s.end, it: s.text, zh: tr.zh[i] || "" })),
+    model: "srt", device: "-", dtype: "-", translationMethod: tr.method, summary: tr.summary || "", glossary: tr.glossary || [], audioMime: audio.type, audio, video: videoBlob,
+    sentences: sentences.map((s, i) => ({ i, start: Math.round(s.start * 1000) / 1000, end: Math.round(s.end * 1000) / 1000, it: s.text, zh: tr.zh[i] || "" })),
   };
   await putLesson(lesson);
   dbg("字幕模式完成 " + sentences.length + " 句");
@@ -862,11 +902,22 @@ function attachPlayer(lesson, audioSrc) {
   try { subMode = Number(localStorage.getItem("miraa-submode") || 0) % 4; } catch (e) {}
   const btnSubMode = $("btnSubMode");
   btnSubMode.textContent = "字幕：" + SUBMODES[subMode];
+  function adjT() { return (orig.currentTime || 0) - subOffset; }
   function showSub(t) {
     if (!lesson.video) return;
-    let s = sentences.find((x) => t >= x.start - 0.05 && t < x.end + 0.05) || null;
+    const s = sentences.find((x) => t >= x.start - 0.02 && t < x.end + 0.05) || null;
     subIt.textContent = s && (subMode === 0 || subMode === 1) ? s.it : "";
     subZh.textContent = s && (subMode === 0 || subMode === 2) ? s.zh : "";
+  }
+  function sentenceAt(t) {
+    if (!sentences.length) return -1;
+    let last = -1;
+    for (let i = 0; i < sentences.length; i++) {
+      const s = sentences[i];
+      if (t >= s.start - 0.02) last = i;
+      if (t <= s.end + 0.05) return t >= s.start - 0.05 ? i : (last >= 0 ? last : i);
+    }
+    return last;
   }
   const mine = $("mine");
   const pbar = $("pbar");
@@ -883,6 +934,13 @@ function attachPlayer(lesson, audioSrc) {
   try { state = Object.assign(state, JSON.parse(localStorage.getItem(storageKey) || "{}")); } catch (e) {}
   let idx = Math.min(Math.max(0, state.last | 0), Math.max(0, sentences.length - 1));
   let looping = false;
+  let pauseEach = false;
+  let subOffset = Number(lesson.subOffset);
+  if (!Number.isFinite(subOffset)) subOffset = Number(state.subOffset);
+  if (!Number.isFinite(subOffset)) subOffset = 0;
+  subOffset = Math.round(Math.max(-5, Math.min(5, subOffset)) * 10) / 10;
+  let raf = 0;
+  let loopGuard = 0;
   let favOnly = false;
   let playing = false;
   let comparing = false;
@@ -989,37 +1047,60 @@ function attachPlayer(lesson, audioSrc) {
     } else listEl.appendChild(frag);
   }
   function currentEl() { return listEl.querySelector('.sentence[data-i="' + idx + '"]'); }
-  function select(i, opts) {
-    opts = opts || {};
+  function highlight(i, scroll) {
     if (i < 0 || i >= sentences.length) return;
+    const changed = i !== idx;
     idx = i;
-    save();
+    if (changed) save();
     nowIt.textContent = sentences[i].it || "";
-    showSub(sentences[i].start + 0.01);
     document.querySelectorAll("#list .sentence").forEach((el) => {
       el.classList.toggle("current", Number(el.dataset.i) === i);
     });
-    if (opts.scroll) {
+    if (scroll && changed) {
       const el = currentEl();
       if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-    pbar.style.width = "0%";
-    if (opts.play) playCurrent();
   }
-  function playCurrent() {
+  function select(i, opts) {
+    opts = opts || {};
+    if (i < 0 || i >= sentences.length) return;
+    highlight(i, !!opts.scroll);
+    showSub(opts.play ? sentences[i].start + 0.01 : adjT());
+    pbar.style.width = "0%";
+    if (opts.play) playCurrent({ seek: true });
+  }
+  function startTick() {
+    if (raf) return;
+    const loop = () => { raf = requestAnimationFrame(loop); onTick(); };
+    raf = requestAnimationFrame(loop);
+  }
+  function stopTick() {
+    if (raf) cancelAnimationFrame(raf);
+    raf = 0;
+  }
+  function seekAndPlay(transcriptStart) {
+    const target = Math.max(0, transcriptStart + subOffset);
+    const go = () => orig.play().then(() => { playing = true; startTick(); syncPlayBtn(); }).catch(() => { playing = false; syncPlayBtn(); });
+    if (orig.readyState < 1) {
+      orig.addEventListener("loadedmetadata", () => { try { orig.currentTime = target; } catch (e) {} go(); }, { once: true });
+      return;
+    }
+    if (Math.abs((orig.currentTime || 0) - target) < 0.07) { go(); return; }
+    let done = false;
+    const finish = () => { if (done) return; done = true; orig.removeEventListener("seeked", finish); go(); };
+    orig.addEventListener("seeked", finish);
+    try { orig.currentTime = target; } catch (e) { finish(); }
+    setTimeout(finish, 350);
+  }
+  function playCurrent(opts) {
     const s = sentences[idx];
     if (!audioSrc || !s) return;
     comparing = false;
-    orig.pause();
     mine.pause();
     orig.playbackRate = Number(speedEl.value) || 1;
-    const start = Math.max(0, s.start);
-    const seek = () => {
-      try { orig.currentTime = start; } catch (e) {}
-      orig.play().then(() => { playing = true; syncPlayBtn(); }).catch(() => { playing = false; syncPlayBtn(); });
-    };
-    if (orig.readyState >= 1) seek();
-    else orig.addEventListener("loadedmetadata", seek, { once: true });
+    if (opts && opts.seek === false) {
+      orig.play().then(() => { playing = true; startTick(); syncPlayBtn(); }).catch(() => { playing = false; syncPlayBtn(); });
+    } else seekAndPlay(s.start);
   }
   function pauseAll() {
     playing = false;
@@ -1035,6 +1116,26 @@ function attachPlayer(lesson, audioSrc) {
     btnLoop2.classList.toggle("on", on);
     btnLoop.textContent = on ? "循环中" : "循环本句";
   }
+  function setPauseEach(on) {
+    pauseEach = !!on;
+    const b = $("btnPauseEach");
+    if (b) { b.classList.toggle("on", pauseEach); b.setAttribute("aria-pressed", pauseEach ? "true" : "false"); }
+  }
+  function renderOffset() {
+    const el = $("offsetVal");
+    if (el) el.textContent = "字幕 " + (subOffset >= 0 ? "+" : "") + subOffset.toFixed(1) + "s";
+  }
+  function changeOffset(d) {
+    subOffset = Math.round((subOffset + d) * 10) / 10;
+    if (subOffset > 5) subOffset = 5;
+    if (subOffset < -5) subOffset = -5;
+    lesson.subOffset = subOffset;
+    state.subOffset = subOffset;
+    save();
+    putLesson(lesson).catch(() => {});
+    renderOffset();
+    showSub(adjT());
+  }
   function setHideZh(on, persist) {
     document.body.classList.toggle("hide-zh", on);
     btnZh.setAttribute("aria-pressed", on ? "false" : "true");
@@ -1042,40 +1143,65 @@ function attachPlayer(lesson, audioSrc) {
     if (persist !== false) { state.hideZh = on; save(); }
   }
 
-  function onTime() {
-    showSub(orig.currentTime);
+  function onTick() {
+    const t = adjT();
+    showSub(t);
     const s = sentences[idx];
-    if (!s || !playing) return;
-    const start = s.start;
-    const end = Math.max(s.end, start + 0.2);
-    const t = orig.currentTime;
-    pbar.style.width = Math.min(100, Math.max(0, ((t - start) / (end - start)) * 100)) + "%";
-    if (t >= end - 0.04) {
-      if (looping && !comparing) {
-        orig.currentTime = start;
-        orig.play().catch(() => {});
-      } else if (comparing && recUrls[idx]) {
-        orig.pause();
-        playing = false;
-        syncPlayBtn();
-        playMine(idx);
-        comparing = false;
-      } else {
-        orig.pause();
-        playing = false;
-        pbar.style.width = "100%";
-        syncPlayBtn();
-      }
+    if (s) {
+      const start = s.start, end = Math.max(s.end, start + 0.2);
+      pbar.style.width = Math.min(100, Math.max(0, ((t - start) / (end - start)) * 100)) + "%";
+    }
+    if (!playing) return;
+    // Continuous mode: only retarget the highlight — never seek/pause at a sentence boundary.
+    const i = sentenceAt(t);
+    if (i >= 0 && i !== idx && !looping && !comparing) highlight(i, true);
+    const cur = sentences[idx];
+    if (!cur) return;
+    const end = Math.max(cur.end, cur.start + 0.2);
+    if (t < end - 0.02) return;
+    if (looping && !comparing) {
+      const now = performance.now();
+      if (now - loopGuard < 200) return;
+      loopGuard = now;
+      seekAndPlay(cur.start);
+    } else if (comparing && recUrls[idx]) {
+      orig.pause();
+      playing = false;
+      syncPlayBtn();
+      playMine(idx);
+      comparing = false;
+    } else if (pauseEach) {
+      orig.pause();
+      playing = false;
+      pbar.style.width = "100%";
+      syncPlayBtn();
     }
   }
   function onEnded() {
-    if (looping) playCurrent();
+    if (looping) playCurrent({ seek: true });
     else { playing = false; syncPlayBtn(); }
   }
-  on(orig, "timeupdate", onTime);
-  on(btnSubMode, "click", () => { subMode = (subMode + 1) % 4; btnSubMode.textContent = "字幕：" + SUBMODES[subMode]; try { localStorage.setItem("miraa-submode", subMode); } catch (e) {} showSub(orig.currentTime); });
+  renderOffset();
+  on(orig, "timeupdate", onTick); // backup when rAF is throttled; no extra seeks in continuous mode
+  on(btnSubMode, "click", () => { subMode = (subMode + 1) % 4; btnSubMode.textContent = "字幕：" + SUBMODES[subMode]; try { localStorage.setItem("miraa-submode", subMode); } catch (e) {} showSub(adjT()); });
   on(orig, "ended", onEnded);
-  on(btnPlay, "click", () => { if (playing) pauseAll(); else playCurrent(); });
+  on(btnPlay, "click", () => {
+    if (playing) { pauseAll(); return; }
+    const s = sentences[idx];
+    const t = adjT();
+    if (s && t >= s.end - 0.08) {
+      if (pauseEach && idx < sentences.length - 1) select(idx + 1, { play: true, scroll: true });
+      else playCurrent({ seek: false });
+      return;
+    }
+    // Resume in place (including lead-in before the first sentence). Seeking is only for list/next/prev/loop.
+    playCurrent({ seek: false });
+  });
+  const btnPauseEach = $("btnPauseEach");
+  if (btnPauseEach) on(btnPauseEach, "click", () => setPauseEach(!pauseEach));
+  const btnOffMinus = $("btnOffMinus"), btnOffPlus = $("btnOffPlus");
+  if (btnOffMinus) on(btnOffMinus, "click", () => changeOffset(-0.1));
+  if (btnOffPlus) on(btnOffPlus, "click", () => changeOffset(0.1));
   on($("btnPrev"), "click", () => select(favOnly ? nearestFav(idx, -1) : idx - 1, { play: true, scroll: true }));
   on($("btnNext"), "click", () => select(favOnly ? nearestFav(idx, 1) : idx + 1, { play: true, scroll: true }));
   function nearestFav(from, dir) {
@@ -1162,6 +1288,7 @@ function attachPlayer(lesson, audioSrc) {
 
   return {
     destroy() {
+      stopTick();
       pauseAll();
       window.removeEventListener("resize", onResize);
       handlers.forEach(([el, ev, fn]) => el.removeEventListener(ev, fn));
@@ -1277,7 +1404,7 @@ audio{display:none}
 </style></head><body>
 <header><div class="head-row"><div><h1 id="title">意大利语跟读</h1><div class="meta" id="meta"></div></div>
 <div class="toggles"><button class="icon-btn" id="btnFavFilter" aria-pressed="false" title="只看收藏">★</button></div></div>
-<div class="toolbar"><button type="button" id="btnZh" aria-pressed="true">隐藏译文</button><button type="button" id="btnLoop">循环本句</button></div></header>
+<div class="toolbar"><button type="button" id="btnZh" aria-pressed="true">隐藏译文</button><button type="button" id="btnLoop">循环本句</button><button type="button" id="btnPauseEach">逐句暂停</button></div></header>
 <main><div id="secureNote" class="warn" hidden>当前页面不是安全环境，麦克风录音可能不可用。跟读播放通常仍可用。</div>
 <div id="noAudio" class="warn" hidden>本课没有嵌入音频。</div><div id="list"></div></main>
 <div id="bar"><div class="progress" aria-hidden="true"><span id="pbar"></span></div>
@@ -1306,7 +1433,7 @@ const LESSON = __LESSON_JSON__;
   let state={last:0,favorites:[],hideZh:false};
   try{state=Object.assign(state,JSON.parse(localStorage.getItem(storageKey)||"{}"))}catch(e){}
   let idx=Math.min(Math.max(0,state.last|0),Math.max(0,sentences.length-1));
-  let looping=false,favOnly=false,playing=false,comparing=false,recorder=null,recStream=null;
+  let looping=false,pauseEach=false,playing=false,comparing=false,recorder=null,recStream=null,raf=0,loopGuard=0;
   const recUrls={};
   if(state.hideZh) setHideZh(true,false);
   renderList(); select(idx,{play:false,scroll:true}); layoutBar();
@@ -1340,22 +1467,31 @@ const LESSON = __LESSON_JSON__;
     if(opts.scroll){const el=currentEl();if(el)el.scrollIntoView({behavior:"smooth",block:"center"})}
     pbar.style.width="0%"; if(opts.play)playCurrent();
   }
-  function playCurrent(){const s=sentences[idx];if(!LESSON.audio_src||!s)return;comparing=false;orig.pause();mine.pause();orig.playbackRate=Number(speedEl.value)||1;
-    const start=Math.max(0,s.start); const seek=()=>{try{orig.currentTime=start}catch(e){} orig.play().then(()=>{playing=true;sync()}).catch(()=>{playing=false;sync()})};
+  function startTick(){if(raf)return;const loop=()=>{raf=requestAnimationFrame(loop);onTick()};raf=requestAnimationFrame(loop)}
+  function playCurrent(opts){const s=sentences[idx];if(!LESSON.audio_src||!s)return;comparing=false;mine.pause();orig.playbackRate=Number(speedEl.value)||1;
+    const start=Math.max(0,s.start); const go=()=>orig.play().then(()=>{playing=true;startTick();sync()}).catch(()=>{playing=false;sync()});
+    if(opts&&opts.seek===false){go();return}
+    const seek=()=>{if(Math.abs((orig.currentTime||0)-start)<0.07){go();return}try{orig.currentTime=start}catch(e){} orig.addEventListener("seeked",go,{once:true});setTimeout(go,350)};
     if(orig.readyState>=1)seek(); else orig.addEventListener("loadedmetadata",seek,{once:true});
   }
   function pauseAll(){playing=false;comparing=false;orig.pause();mine.pause();sync()}
   function sync(){btnPlay.textContent=playing?"⏸ 暂停":"▶ 播放"}
   function setLoop(on){looping=on;btnLoop.classList.toggle("on",on);btnLoop2.classList.toggle("on",on);btnLoop.textContent=on?"循环中":"循环本句"}
+  function setPauseEach(on){pauseEach=!!on;const b=document.getElementById("btnPauseEach");if(b){b.classList.toggle("on",pauseEach);b.setAttribute("aria-pressed",pauseEach?"true":"false")}}
   function setHideZh(on,persist){document.body.classList.toggle("hide-zh",on);btnZh.setAttribute("aria-pressed",on?"false":"true");btnZh.textContent=on?"显示译文":"隐藏译文";if(persist!==false){state.hideZh=on;save()}}
-  orig.addEventListener("timeupdate",()=>{const s=sentences[idx];if(!s||!playing)return;const start=s.start,end=Math.max(s.end,start+0.2),t=orig.currentTime;
+  function onTick(){const s=sentences[idx];if(!s)return;const start=s.start,end=Math.max(s.end,start+0.2),t=orig.currentTime;
     pbar.style.width=Math.min(100,Math.max(0,((t-start)/(end-start))*100))+"%";
-    if(t>=end-0.04){if(looping&&!comparing){orig.currentTime=start;orig.play().catch(()=>{})}
+    if(!playing)return;
+    if(!looping&&!comparing){for(let i=0;i<sentences.length;i++){if(t>=sentences[i].start-0.05&&t<Math.max(sentences[i].end,sentences[i].start+0.2)+0.05){if(i!==idx){idx=i;save();nowIt.textContent=sentences[i].it||"";document.querySelectorAll(".sentence").forEach(el=>el.classList.toggle("current",Number(el.dataset.i)===i));const el=currentEl();if(el)el.scrollIntoView({behavior:"smooth",block:"center"})}break;}}}
+    if(t>=end-0.02){if(looping&&!comparing){const now=performance.now();if(now-loopGuard<200)return;loopGuard=now;try{orig.currentTime=start}catch(e){}orig.play().catch(()=>{})}
       else if(comparing&&recUrls[idx]){orig.pause();playing=false;sync();playMine(idx);comparing=false}
-      else{orig.pause();playing=false;pbar.style.width="100%";sync()}}
-  });
-  orig.addEventListener("ended",()=>{if(looping)playCurrent();else{playing=false;sync()}});
-  btnPlay.addEventListener("click",()=>{if(playing)pauseAll();else playCurrent()});
+      else if(pauseEach){orig.pause();playing=false;pbar.style.width="100%";sync()}}
+    const xs=document.getElementById("xsub"); if(xs){const hit=sentences.find(x=>t>=x.start&&t<x.end);xs.innerHTML=hit?(hit.it.replace(/</g,"&lt;")+"<br><span style='color:#ffe7a8;font-weight:400'>"+(hit.zh||"").replace(/</g,"&lt;")+"</span>"):""}
+  }
+  orig.addEventListener("timeupdate",onTick);
+  orig.addEventListener("ended",()=>{if(looping)playCurrent({seek:true});else{playing=false;sync()}});
+  btnPlay.addEventListener("click",()=>{if(playing){pauseAll();return}const s=sentences[idx],t=orig.currentTime;if(s&&t>=s.end-0.08){if(pauseEach&&idx<sentences.length-1)select(idx+1,{play:true,scroll:true});else playCurrent({seek:false});return}if(s&&t>=s.start-0.05&&t<s.end-0.08)playCurrent({seek:false});else playCurrent({seek:true})});
+  const btnPauseEach=document.getElementById("btnPauseEach"); if(btnPauseEach) btnPauseEach.addEventListener("click",()=>setPauseEach(!pauseEach));
   function nearestFav(from,dir){const favs=state.favorites.slice().sort((a,b)=>a-b);if(!favs.length)return from;if(dir>0)return favs.find(i=>i>from)??favs[0];const prev=favs.filter(i=>i<from);return prev.length?prev[prev.length-1]:favs[favs.length-1]}
   document.getElementById("btnPrev").addEventListener("click",()=>select(favOnly?nearestFav(idx,-1):idx-1,{play:true,scroll:true}));
   document.getElementById("btnNext").addEventListener("click",()=>select(favOnly?nearestFav(idx,1):idx+1,{play:true,scroll:true}));
@@ -1455,6 +1591,7 @@ function boot() {
     processWithSrt,
     listLessons,
     getLesson,
+    putLesson,
     openLesson,
   };
 }

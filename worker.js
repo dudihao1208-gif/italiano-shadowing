@@ -140,25 +140,33 @@ function chunksFrom(result, offsetSec, blockDur) {
   return out;
 }
 
+async function transcribePcm(pcm, offsetSec, blockDur) {
+  const base = { language: "italian", task: "transcribe", chunk_length_s: 30, stride_length_s: 5 };
+  try {
+    const r = await transcriber(pcm, { ...base, return_timestamps: "word" });
+    const segs = chunksFrom(r, offsetSec, blockDur);
+    if (segs.length) {
+      post({ type: "log", message: "词级时间戳 " + segs.length + " 个词" });
+      return segs;
+    }
+  } catch (e) {
+    post({ type: "log", message: "词级时间戳不可用，改用片段级：" + ((e && e.message) || e) });
+  }
+  const r = await transcriber(pcm, { ...base, return_timestamps: true });
+  return chunksFrom(r, offsetSec, blockDur);
+}
+
 async function transcribe(audio) {
   if (!transcriber) throw new Error("模型尚未加载");
   const pcm = audio instanceof Float32Array ? audio : new Float32Array(audio);
   const totalSec = pcm.length / RATE;
   const segments = [];
-  const opts = {
-    language: "italian",
-    task: "transcribe",
-    return_timestamps: true,
-    chunk_length_s: 30,
-    stride_length_s: 5,
-  };
 
   // Short clips in one go; longer audio in 90 s blocks for progress + RAM.
   const useBlocks = pcm.length > BLOCK;
   if (!useBlocks) {
     post({ type: "progress", phase: "transcribe", pct: 5, status: "running", doneSec: 0, totalSec });
-    const result = await transcriber(pcm, opts);
-    segments.push(...chunksFrom(result, 0, totalSec));
+    segments.push(...await transcribePcm(pcm, 0, totalSec));
     post({ type: "progress", phase: "transcribe", pct: 100, status: "done" });
   } else {
     const step = BLOCK;
@@ -174,8 +182,7 @@ async function transcribe(audio) {
         doneSec: offset,
         totalSec,
       });
-      const result = await transcriber(block, opts);
-      segments.push(...chunksFrom(result, offset, block.length / RATE));
+      segments.push(...await transcribePcm(block, offset, block.length / RATE));
       const pct = Math.min(99, Math.round((end / pcm.length) * 100));
       post({ type: "progress", phase: "transcribe", pct, status: "running", doneSec: end / RATE, totalSec });
     }
@@ -193,8 +200,8 @@ self.onmessage = async (ev) => {
     } else if (msg.type === "chunk") {
       if (!transcriber) throw new Error("模型尚未加载");
       const pcm = msg.audio;
-      const r = await transcriber(pcm, { language: "italian", task: "transcribe", return_timestamps: true, chunk_length_s: 30 });
-      post({ type: "chunkResult", segments: chunksFrom(r, msg.offset || 0, pcm.length / RATE) });
+      const segs = await transcribePcm(pcm, msg.offset || 0, pcm.length / RATE);
+      post({ type: "chunkResult", segments: segs });
     } else if (msg.type === "ping") {
       post({ type: "pong" });
     }

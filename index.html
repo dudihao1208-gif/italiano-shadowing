@@ -200,6 +200,9 @@
   #sub .szh { font-size: .85rem; color: #ffe7a8; margin-top: 3px; }
   #sub .sit:empty, #sub .szh:empty { display: none; }
   #sub { display: flex; flex-direction: column; align-items: center; }
+  .offset-box { display: inline-flex; align-items: center; gap: 4px; }
+  .offset-box button { min-width: 36px; padding: 6px 10px; }
+  #offsetVal { font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 6.2em; text-align: center; }
 </style>
 </head>
 <body class="view-lib">
@@ -278,7 +281,13 @@
     <div class="toolbar">
       <button type="button" id="btnZh" aria-pressed="true">隐藏译文</button>
       <button type="button" id="btnLoop">循环本句</button>
+      <button type="button" id="btnPauseEach" aria-pressed="false">逐句暂停</button>
       <button type="button" id="btnSubMode" hidden>字幕：双语</button>
+      <span class="offset-box" id="offsetBox" title="若字幕比声音早，按 + 推迟；若比声音晚，按 − 提前">
+        <button type="button" id="btnOffMinus" aria-label="字幕提前 0.1 秒">−</button>
+        <span id="offsetVal">字幕 0.0s</span>
+        <button type="button" id="btnOffPlus" aria-label="字幕推迟 0.1 秒">+</button>
+      </span>
       <button type="button" id="btnExport">导出这一课</button>
     </div>
   </div>
